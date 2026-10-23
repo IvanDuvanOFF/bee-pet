@@ -112,6 +112,7 @@ class FakeBee(QObject):
     mood_changed = Signal(object)
     biting_toggled = Signal(bool)
     drag_started = Signal()
+    drag_finished = Signal()
 
     def __init__(self):
         super().__init__()
@@ -394,3 +395,115 @@ def test_model_angry_high_closes_window(qapp):
     bee.land()
     wait_state(ctl, ctl.IDLE)
     assert api.closed == [7]
+
+
+# --- повторные попытки ---------------------------------------------------------
+
+def grab(bee):
+    bee.is_dragging = True
+    bee.drag_started.emit()
+
+
+def release(bee):
+    bee.is_dragging = False
+    bee.drag_finished.emit()
+
+
+def test_angry_high_while_dragged_bites_after_release(qapp):
+    """Пчелу держат 8 с (дважды *grabs your wings*): укус после отпускания."""
+    bee, api, clock, ctl = make(qapp)
+    grab(bee)
+    bee.act(Action.GRAB)
+    bee.act(Action.GRAB)
+    assert bee.engine.angry_high and ctl.state == ctl.IDLE and not bee.flights
+    release(bee)
+    assert ctl.state == ctl.FLYING and len(bee.flights) == 1
+    bee.land()
+    wait_state(ctl, ctl.IDLE)
+    assert api.closed == [7]
+
+
+def test_release_when_not_angry_high_does_nothing(qapp):
+    bee, api, clock, ctl = make(qapp)
+    grab(bee)
+    bee.act(Action.SWAT)  # просто angry
+    release(bee)
+    assert ctl.state == ctl.IDLE and not bee.flights
+
+
+def test_retry_on_further_provocation_while_angry_high(qapp):
+    """angry-high уже был (укус был невозможен), новая провокация без became — укус."""
+    bee, api, clock, ctl = make(qapp, windows=[])
+    rage(bee)
+    assert ctl.state == ctl.IDLE  # нет окон
+    api.windows = [win(hwnd=7)]
+    change = bee.act(Action.SWAT)
+    assert change.angry_high and not change.became_angry_high
+    assert ctl.state == ctl.FLYING and len(bee.flights) == 1
+
+
+def test_retry_does_not_start_second_sequence(qapp):
+    bee, api, clock, ctl = make(qapp)
+    rage(bee)
+    assert ctl.state == ctl.FLYING
+    bee.act(Action.SWAT)
+    release(bee)  # лишний drag_finished тоже не мешает
+    assert ctl.state == ctl.FLYING and len(bee.flights) == 1
+    bee.land()
+    bee.act(Action.FLOWER)
+    assert ctl.state == ctl.WARNING and len(bee.flights) == 1
+    assert ctl._target is not None and ctl._target.hwnd == 7
+
+
+def test_retries_respect_episode_and_cooldown(qapp):
+    bee, api, clock, ctl = make(qapp)
+    rage(bee)
+    bee.land()
+    wait_state(ctl, ctl.IDLE)
+    assert api.closed == [7]
+    clock.t += 10_000  # пауза прошла, но приступ тот же
+    bee.act(Action.SWAT)
+    grab(bee)
+    release(bee)
+    assert ctl.state == ctl.IDLE and len(bee.flights) == 1
+    # новый приступ внутри паузы: повторные попытки тоже отказывают
+    bee2, api2, clock2, ctl2 = make(qapp)
+    rage(bee2)
+    bee2.land()
+    wait_state(ctl2, ctl2.IDLE)
+    bee2.act(Action.SORRY)
+    clock2.t += 60
+    rage(bee2)
+    bee2.act(Action.SWAT)
+    grab(bee2)
+    release(bee2)
+    assert ctl2.state == ctl2.IDLE and len(bee2.flights) == 1
+
+
+def test_drag_mid_countdown_cancels_then_retries_after_release(qapp):
+    bee, api, clock, ctl = make(qapp, tick_ms=50)
+    rage(bee)
+    bee.land()
+    assert ctl.state == ctl.WARNING
+    grab(bee)
+    assert ctl.state == ctl.IDLE
+    bee.act(Action.SWAT)  # провокация, пока держат: не стартует
+    QTest.qWait(120)
+    assert ctl.state == ctl.IDLE and len(bee.flights) == 1 and api.closed == []
+    release(bee)
+    assert ctl.state == ctl.FLYING and len(bee.flights) == 2
+    bee.land()
+    wait_state(ctl, ctl.IDLE)
+    assert api.closed == [7]
+
+
+def test_repeated_refusal_logged_once(qapp, caplog):
+    bee, api, clock, ctl = make(qapp)
+    bee.biting_enabled = False
+    with caplog.at_level("INFO", logger="bee_pet.biting"):
+        rage(bee)
+        bee.act(Action.SWAT)
+        bee.act(Action.FLOWER)
+    refusals = [r for r in caplog.records
+                if r.levelname == "INFO" and "не кусаю" in r.getMessage()]
+    assert len(refusals) == 1

@@ -184,6 +184,7 @@ class BiteController(QObject):
         self._last_bite: float | None = None
         self._target: WindowInfo | None = None
         self._left = 0
+        self._last_refusal: str | None = None  # чтобы не повторять в логе одну и ту же причину
 
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(tick_ms)
@@ -196,16 +197,23 @@ class BiteController(QObject):
         bee.mood_changed.connect(self.on_mood_changed)
         bee.biting_toggled.connect(self.on_biting_toggled)
         bee.drag_started.connect(self.on_drag_started)
+        bee.drag_finished.connect(self.on_drag_finished)
 
     # --- события -----------------------------------------------------------
 
     def on_mood_changed(self, change: MoodChange) -> None:
-        """Старт по became_angry_high; отмена, когда злость спала; конец эпизода — выход из ANGRY."""
+        """Попытка укуса при каждом angry-high (не только при переходе в него).
+
+        Так пчела, которую разозлили, пока её тащили (или пока укус был невозможен),
+        идёт кусать при следующей провокации. Отмена — когда злость спала; конец
+        эпизода — выход из ANGRY. Все предохранители проверяет _try_start.
+        """
         if change.new is not Mood.ANGRY:
             self._bitten_this_episode = False  # приступ закончился
+            self._last_refusal = None
         if self.state != self.IDLE and not change.angry_high:
             self._cancel("настроение больше не angry-high")
-        if change.became_angry_high:
+        if change.angry_high:
             self._try_start()
 
     def on_biting_toggled(self, enabled: bool) -> None:
@@ -215,6 +223,11 @@ class BiteController(QObject):
     def on_drag_started(self) -> None:
         if self.state != self.IDLE:
             self._cancel("пчелу взяли в руки")
+
+    def on_drag_finished(self) -> None:
+        """Отпустили всё ещё разъярённую пчелу — она снова пробует укусить."""
+        if self._bee.engine.angry_high:
+            self._try_start()
 
     # --- старт -------------------------------------------------------------
 
@@ -233,18 +246,27 @@ class BiteController(QObject):
         elif self._bee.is_dragging:
             refuse = "пчелу тащат"
         if refuse:
-            log.info("не кусаю: %s", refuse)
+            self._refuse(refuse)
             return
         screens = self._screens_provider()
         target = pick_target(self._winapi.list_windows(), self._own_pid, self._whitelist,
                              self._rng, physical_screen_rects(screens))
         if target is None:
-            log.info("не кусаю: нет подходящих окон")
+            self._refuse("нет подходящих окон")
             return
+        self._last_refusal = None
         log.info("цель: %r (%s, hwnd=%s)", target.title, target.process_name, target.hwnd)
         self._target = target
         self.state = self.FLYING
         self._bee.fly_to(self._bee_corner(target, screens), self._on_arrived)
+
+    def _refuse(self, reason: str) -> None:
+        """Пишет отказ в лог; та же причина подряд повторно не пишется (до смены причины или эпизода)."""
+        if reason != self._last_refusal:
+            log.info("не кусаю: %s", reason)
+        else:
+            log.debug("не кусаю: %s", reason)
+        self._last_refusal = reason
 
     def _bee_corner(self, target: WindowInfo, screens) -> QPoint:
         """Левый верхний угол окна пчелы: она висит над заголовком, примерно на 1/3 его ширины."""

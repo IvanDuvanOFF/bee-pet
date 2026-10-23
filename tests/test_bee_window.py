@@ -4,7 +4,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QPoint, QRect, QSettings
+from PySide6.QtCore import QEasingCurve, QPoint, QRect, QSettings, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -125,6 +125,39 @@ def test_cancel_flight_skips_callback(bee):
     bee.cancel_flight()
     QTest.qWait(500)
     assert arrived == [] and not bee.is_flying
+
+
+def test_fly_to_default_duration_unchanged(bee):
+    start = bee.pos()
+    assert bee.fly_to(start - QPoint(400, 0)) == 1000   # 400 px при 400 px/с
+    assert bee.fly_to(bee.pos() - QPoint(10, 0)) == 300  # не короче 300 мс
+    assert bee.fly_to(bee.pos() - QPoint(5000, 0)) == 3000  # не дольше 3 с
+    assert bee._flight.easingCurve().type() == QEasingCurve.InOutSine
+    bee.cancel_flight()
+
+
+def test_fly_to_speed_min_ms_and_easing(bee):
+    start = bee.pos()
+    assert bee.fly_to(start - QPoint(300, 0), speed=1500.0, min_ms=80,
+                      easing=QEasingCurve.Linear) == 200
+    assert bee._flight.easingCurve().type() == QEasingCurve.Linear
+    assert bee.fly_to(bee.pos() - QPoint(30, 0), speed=1500.0, min_ms=80) == 80
+    assert bee.fly_to(bee.pos() - QPoint(30, 0), speed=1500.0, min_ms=150) == 150
+    bee.cancel_flight()
+
+
+def test_drag_finished_only_after_real_drag(bee):
+    started, finished = [], []
+    bee.drag_started.connect(lambda: started.append(1))
+    bee.drag_finished.connect(lambda: finished.append(1))
+    QTest.mouseClick(bee, Qt.LeftButton, pos=QPoint(60, 60))  # клик без переноса
+    assert (started, finished) == ([], [])
+    QTest.mousePress(bee, Qt.LeftButton, pos=QPoint(60, 60))
+    QTest.mouseMove(bee, QPoint(90, 90))
+    QTest.mouseMove(bee, QPoint(100, 100))
+    assert bee.is_dragging and started == [1] and finished == []
+    QTest.mouseRelease(bee, Qt.LeftButton, pos=QPoint(100, 100))
+    assert not bee.is_dragging and finished == [1]
 
 
 @pytest.mark.parametrize("mood", list(Mood))

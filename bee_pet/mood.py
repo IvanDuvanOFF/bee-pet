@@ -27,6 +27,8 @@ class Action(Enum):
     SPRAY = "spray"
     SWAT = "swat"
     SORRY = "sorry"
+    GRAB = "grab"        # пчелу долго держат за крылья
+    RELEASE = "release"  # отпустили вскоре после того, как она разозлилась
     GIBBERISH = "gibberish"
     OTHER = "other"
 
@@ -40,6 +42,8 @@ ACTION_PHRASES: dict[Action, str] = {
     Action.SPRAY: "*sprays you with bug spray*",
     Action.SWAT: "*swats you*",
     Action.SORRY: "sorry",
+    Action.GRAB: "*grabs your wings*",
+    Action.RELEASE: "*lets you go* sorry",
 }
 
 # Длительности затухания, секунды.
@@ -140,11 +144,14 @@ _CALM_TRANSITIONS: dict[Action, Mood] = {
     Action.PET: Mood.HAPPY,
     Action.SPRAY: Mood.SAD,
     Action.SWAT: Mood.ANGRY,
+    Action.GRAB: Mood.ANGRY,
     Action.SORRY: Mood.NEUTRAL,
     Action.GIBBERISH: Mood.CONFUSED,
 }
 
-_ANGRY_ESCALATORS = {Action.FLOWER, Action.LOVE, Action.PET, Action.SWAT, Action.SPRAY}
+_ANGRY_ESCALATORS = {Action.FLOWER, Action.LOVE, Action.PET, Action.SWAT, Action.SPRAY,
+                     Action.GRAB}
+_ANGRY_CALMERS = {Action.SORRY, Action.RELEASE}  # «*lets you go* sorry» — тоже извинение
 
 
 class MoodEngine:
@@ -172,13 +179,13 @@ class MoodEngine:
     def apply(self, action: Action) -> MoodChange:
         """Применяет действие по таблице переходов (запасной путь, когда модели нет).
 
-        Злая пчела успокаивается только от SORRY (-> NEUTRAL). Цветок, любовь,
-        поглаживание, шлепок и дихлофос злят сильнее (angry high), а всё остальное
-        оставляет злость как есть. Любое действие, после которого пчела всё ещё злится,
+        Злая пчела успокаивается только от SORRY и RELEASE (-> NEUTRAL). Цветок, любовь,
+        поглаживание, шлепок, дихлофос и хватание за крылья злят сильнее (angry high),
+        а всё остальное оставляет злость как есть. Любое действие, после которого пчела всё ещё злится,
         перезапускает таймеры затухания злости: они отсчитываются от последней провокации.
         """
         if self.mood is Mood.ANGRY:
-            if action is Action.SORRY:
+            if action in _ANGRY_CALMERS:
                 return self._set(Mood.NEUTRAL, False)
             if action in _ANGRY_ESCALATORS:
                 return self._set(Mood.ANGRY, True, refresh=True)

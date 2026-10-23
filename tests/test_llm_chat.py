@@ -223,15 +223,25 @@ def test_client_fallback_and_backoff(qapp):
     assert calls == ["a", "c"] and len(got) == 3
 
 
-def test_client_tag_only_reply_is_failure(qapp):
-    client = BeeClient(ask=lambda msgs: "[happy:low]  ")
+def test_client_tag_only_reply_is_fallback_without_backoff(qapp):
+    """Пустой ответ — заготовка, но сервер жив: офлайн-паузы нет, следующий запрос идёт в сеть."""
+    calls = []
+
+    def silent(msgs):
+        calls.append(msgs[-1]["content"])
+        return "[happy:low]  "
+
+    client = BeeClient(ask=silent, backoff=30)
     got = []
     client.reply_ready.connect(lambda *a: got.append(a))
     client.request("hi", tag="t")
     QTest.qWait(300)
-    client.shutdown()
     assert len(got) == 1 and got[0][1] in FALLBACK_BUZZ and got[0][2] is False
-    assert client.online is False
+    assert client.online is True and client.likely_online()
+    client.request("again", tag="t2")
+    QTest.qWait(300)
+    client.shutdown()
+    assert calls == ["hi", "again"]
 
 
 def test_client_sends_history_and_caps_it(qapp):
@@ -316,6 +326,57 @@ def test_client_remember_false_sends_single_message_and_skips_history(qapp):
         {"role": "assistant", "content": "[neutral:low] re *swats you*"},
         {"role": "user", "content": "sorry"},
     ]
+
+
+def test_client_use_history_without_remember(qapp):
+    """remember=False, use_history=True: модель видит диалог, но обмен не запоминается."""
+    seen = []
+
+    def ask(messages):
+        seen.append(messages)
+        return f"[angry:low] re {messages[-1]['content']}"
+
+    client = BeeClient(ask=ask)
+    got = []
+    client.reply_ready.connect(lambda *a: got.append(a))
+    client.request("*swats you*")
+    _wait_count(got, 1)
+    client.request("hmm", tag="ping", remember=False, use_history=True)
+    _wait_count(got, 2)
+    client.request("sorry")
+    _wait_count(got, 3)
+    client.shutdown()
+    swat = [{"role": "user", "content": "*swats you*"},
+            {"role": "assistant", "content": "[angry:low] re *swats you*"}]
+    assert seen[1] == swat + [{"role": "user", "content": "hmm"}]
+    assert got[1] == ("ping", "re hmm", True)
+    assert seen[2] == swat + [{"role": "user", "content": "sorry"}]  # «hmm» не запомнен
+    assert client.likely_online()
+
+
+def test_client_use_history_default_follows_remember(qapp):
+    seen = []
+
+    def ask(messages):
+        seen.append(messages)
+        return "[neutral:low] bzz"
+
+    client = BeeClient(ask=ask)
+    got = []
+    client.reply_ready.connect(lambda *a: got.append(a))
+    client.request("hi")
+    _wait_count(got, 1)
+    client.request("fly", remember=False)
+    _wait_count(got, 2)
+    client.request("hey", use_history=False)  # запомнить, но без истории
+    _wait_count(got, 3)
+    client.request("yo")
+    _wait_count(got, 4)
+    client.shutdown()
+    assert seen[1] == [{"role": "user", "content": "fly"}]
+    assert seen[2] == [{"role": "user", "content": "hey"}]
+    assert [m["content"] for m in seen[3]] == ["hi", "[neutral:low] bzz", "hey",
+                                               "[neutral:low] bzz", "yo"]
 
 
 # --- ChatWindow ------------------------------------------------------------

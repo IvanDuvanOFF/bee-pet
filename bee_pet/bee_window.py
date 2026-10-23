@@ -95,6 +95,7 @@ class BeeWindow(QWidget):
     biting_toggled = Signal(bool)
     focus_switch_toggled = Signal(bool)
     drag_started = Signal()
+    drag_finished = Signal()  # кнопку отпустили после настоящего перетаскивания
 
     def __init__(self, settings: QSettings | None = None,
                  engine: MoodEngine | None = None,
@@ -293,10 +294,13 @@ class BeeWindow(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:
+            was_dragging = self._dragging
             self._press_global = None
             self._dragging = False
             self._wiggle = (0.0, 0.0)
             self.update()
+            if was_dragging:
+                self.drag_finished.emit()
 
     # --- мельтешение курсором ----------------------------------------------
 
@@ -314,23 +318,31 @@ class BeeWindow(QWidget):
 
     # --- полёт -------------------------------------------------------------
 
-    def fly_to(self, target: QPoint, on_arrived: Callable[[], None] | None = None) -> None:
-        """Плавно переносит левый верхний угол окна в target; по прилёту зовёт on_arrived."""
+    def fly_to(self, target: QPoint, on_arrived: Callable[[], None] | None = None, *,
+               speed: float | None = None, min_ms: int = 300,
+               easing: QEasingCurve.Type = QEasingCurve.InOutSine) -> int:
+        """Переносит левый верхний угол окна в target; по прилёту зовёт on_arrived.
+
+        speed — скорость в px/с (по умолчанию FLIGHT_SPEED), min_ms — самый короткий полёт,
+        easing — кривая движения. Полёт длится не дольше 3 с. Возвращает длительность в мс.
+        """
         self.cancel_flight()
         start = self.pos()
         dx, dy = target.x() - start.x(), target.y() - start.y()
         dist = math.hypot(dx, dy)
-        duration = int(max(300, min(3000, dist / FLIGHT_SPEED * 1000)))
+        speed = FLIGHT_SPEED if speed is None else speed
+        duration = int(max(min_ms, min(3000, dist / speed * 1000)))
         self._tilt = 20.0 * dx / dist if dist > 1 else 0.0
         self._on_arrived = on_arrived
         anim = QPropertyAnimation(self, b"pos", self)
         anim.setStartValue(start)
         anim.setEndValue(target)
         anim.setDuration(duration)
-        anim.setEasingCurve(QEasingCurve.InOutSine)
+        anim.setEasingCurve(easing)
         anim.finished.connect(self._on_flight_finished)
         self._flight = anim
         anim.start()
+        return duration
 
     def cancel_flight(self) -> None:
         """Прерывает полёт без вызова on_arrived."""
@@ -344,6 +356,11 @@ class BeeWindow(QWidget):
     def is_dragging(self) -> bool:
         """Тащит ли пользователь пчелу прямо сейчас."""
         return self._dragging
+
+    @property
+    def is_pressed(self) -> bool:
+        """Зажата ли левая кнопка мыши на пчеле (перетаскивание могло ещё не начаться)."""
+        return self._press_global is not None
 
     @property
     def is_flying(self) -> bool:

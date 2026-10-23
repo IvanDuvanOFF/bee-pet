@@ -86,8 +86,9 @@ def clean_reply(text: str) -> str:
 
 class _WorkerSignals(QObject):
     """Сигналы воркера (QRunnable сам не QObject)."""
-    # tag, text, from_model, prompt, raw (сырой ответ модели; пустой при сбое), remember
-    done = Signal(object, str, bool, str, str, bool)
+    # tag, text, from_model, prompt, raw (сырой ответ модели; пустой при сбое), remember,
+    # reachable (сервер ответил, пусть даже пустой строкой)
+    done = Signal(object, str, bool, str, str, bool, bool)
 
 
 class _AskRunnable(QRunnable):
@@ -102,14 +103,18 @@ class _AskRunnable(QRunnable):
     def run(self) -> None:
         try:
             raw = self._ask(self._messages)
-            text = strip_mood_tag(raw)
-            if not text:
-                raise ValueError("пустой ответ")
-            result = (clean_reply(text), True, self._prompt, raw.strip())
         except Exception:  # любой сбой сети или формата -> заготовка
-            result = (random_fallback(), False, self._prompt, "")
+            result = (random_fallback(), False, self._prompt, "", False)
+        else:
+            text = strip_mood_tag(raw)
+            if text:
+                result = (clean_reply(text), True, self._prompt, raw.strip(), True)
+            else:
+                # Модель иногда молчит (например, после «*stings you and then dies*»):
+                # сервер жив, поэтому заготовка — но без офлайн-паузы.
+                result = (random_fallback(), False, self._prompt, "", True)
         try:
-            self._signals.done.emit(self._tag, *result, self._remember)
+            self._signals.done.emit(self._tag, *result[:4], self._remember, result[4])
         except RuntimeError:
             pass  # объект сигналов уже удалён при выходе из приложения
 
@@ -155,30 +160,39 @@ class BeeClient(QObject):
         """False, только если недавний сбой и пауза перед новой попыткой ещё идёт."""
         return not (self.online is False and self._clock() < self._offline_until)
 
-    def request(self, prompt: str, tag: object = None, remember: bool = True) -> None:
+    def request(self, prompt: str, tag: object = None, remember: bool = True,
+                use_history: bool | None = None) -> None:
         """Запрашивает ответ; при недавнем сбое сразу отвечает заготовкой.
 
-        remember=False — разовая реплика: модель получает только её (без истории),
-        и ответ в историю не попадает (например, жужжание в полёте).
+        remember=False — ответ в историю не попадает. use_history — отправлять ли
+        модели историю диалога (по умолчанию так же, как remember):
+        - remember=False — разовая реплика без истории (жужжание в полёте);
+        - remember=False, use_history=True — модель видит диалог и отвечает в тон,
+          но сам обмен не запоминается (жужжание само по себе, chatter.py).
         """
+        if use_history is None:
+            use_history = remember
         if not self.likely_online():
             text = random_fallback()
             QTimer.singleShot(0, lambda: self.reply_ready.emit(tag, text, False))
             return
-        if remember:
+        if use_history:
             messages = self._build_messages(prompt)
         else:
             messages = [{"role": "user", "content": prompt}]
         self._pool.start(_AskRunnable(self._ask, messages, prompt, tag, self._signals, remember))
 
-    @Slot(object, str, bool, str, str, bool)
+    @Slot(object, str, bool, str, str, bool, bool)
     def _on_done(self, tag: object, text: str, from_model: bool,
-                 prompt: str, raw: str, remember: bool = True) -> None:
-        self.online = from_model
+                 prompt: str, raw: str, remember: bool = True,
+                 reachable: bool | None = None) -> None:
+        if reachable is None:
+            reachable = from_model
+        self.online = reachable
         if from_model and remember:
             self._history.append((prompt, raw))
-        else:
-            # Заготовки в историю не попадают: модель их не говорила.
+        if not reachable:
+            # Офлайн-пауза только при сетевом сбое; заготовки в историю не попадают.
             self._offline_until = self._clock() + self._backoff
         parsed = parse_mood_tag(raw) if from_model else None
         if parsed is not None:

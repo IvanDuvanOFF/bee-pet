@@ -250,3 +250,39 @@ def test_set_from_model_high_only_for_angry_and_decays():
     clock.t += ANGRY_HIGH_DECAY
     change = eng.tick()
     assert change is not None and change.new is Mood.ANGRY and not change.angry_high
+
+
+# --- удержание мышкой: GRAB и RELEASE -------------------------------------------
+
+def test_grab_release_phrases_classified_exactly():
+    assert ACTION_PHRASES[Action.GRAB] == "*grabs your wings*"
+    assert ACTION_PHRASES[Action.RELEASE] == "*lets you go* sorry"
+    assert classify("*grabs your wings*") is Action.GRAB
+    assert classify("*lets you go* sorry") is Action.RELEASE
+
+
+def test_grab_makes_calm_bee_angry_then_angry_high():
+    eng, _ = make()
+    change = eng.apply(Action.GRAB)
+    assert eng.mood is Mood.ANGRY and not eng.angry_high and not change.became_angry_high
+    change = eng.apply(Action.GRAB)
+    assert eng.mood is Mood.ANGRY and eng.angry_high and change.became_angry_high
+
+
+def test_release_calms_angry_bee_like_sorry():
+    eng, _ = angry()
+    eng.apply(Action.RELEASE)
+    assert eng.mood is Mood.NEUTRAL and not eng.angry_high
+    eng, _ = angry()
+    eng.apply(Action.GRAB)
+    eng.apply(Action.RELEASE)
+    assert eng.mood is Mood.NEUTRAL
+
+
+@pytest.mark.parametrize("start", [Action.HI, Action.FLOWER, Action.LOVE, Action.SPRAY])
+def test_release_does_not_change_calm_mood(start):
+    eng, _ = make()
+    eng.apply(start)
+    before = eng.mood
+    eng.apply(Action.RELEASE)
+    assert eng.mood is before
