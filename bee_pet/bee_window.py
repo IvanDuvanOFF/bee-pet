@@ -13,7 +13,6 @@ from PySide6.QtGui import QAction, QGuiApplication, QPainter
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from bee_pet.bubble import SpeechBubble
-from bee_pet.lines import reaction
 from bee_pet.mood import Action, Mood, MoodChange, MoodEngine
 from bee_pet.painter import PaintState, paint_bee
 
@@ -90,6 +89,7 @@ class BeeWindow(QWidget):
     """Прозрачное безрамочное окно с пчелой."""
 
     mood_changed = Signal(object)       # MoodChange
+    mood_decayed = Signal(object)       # MoodChange: затухание по таймеру, не действие
     action_performed = Signal(object)   # Action из меню
     chat_requested = Signal()
     biting_toggled = Signal(bool)
@@ -109,6 +109,9 @@ class BeeWindow(QWidget):
         self._biting = self._settings.value("biting_enabled", True, type=bool)
         self._focus_switch = self._settings.value("focus_switch_enabled", True, type=bool)
         self.engine = engine if engine is not None else MoodEngine()
+        # True — настроение по командам меню выставляет MoodSync по ответу модели;
+        # False (пчела без клиента) — сразу по локальным правилам.
+        self.mood_deferred = False
         self.bubble = SpeechBubble()
 
         self._phase = 0.0
@@ -187,10 +190,10 @@ class BeeWindow(QWidget):
         self.menu.exec(event.globalPos())
 
     def _on_menu_action(self, action: Action) -> None:
-        was_angry = self.engine.mood is Mood.ANGRY
-        self.apply_action(action)
+        """Сообщает о действии; реплику (и настроение, если оно отложено) даёт ответ модели."""
+        if not self.mood_deferred:
+            self.apply_action(action)
         self.action_performed.emit(action)
-        self.say(reaction(action, was_angry))
 
     # --- настроение --------------------------------------------------------
 
@@ -201,11 +204,19 @@ class BeeWindow(QWidget):
         self.mood_changed.emit(change)
         return change
 
+    def apply_model_mood(self, mood: Mood, angry_high: bool) -> MoodChange:
+        """Ставит настроение из тега ответа модели, перерисовывает и сообщает об изменении."""
+        change = self.engine.set_from_model(mood, angry_high)
+        self.update()
+        self.mood_changed.emit(change)
+        return change
+
     def _on_mood_tick(self) -> None:
         change = self.engine.tick()
         if change is not None:
             self.update()
             self.mood_changed.emit(change)
+            self.mood_decayed.emit(change)
 
     # --- пузырь ------------------------------------------------------------
 

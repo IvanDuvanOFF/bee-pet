@@ -150,6 +150,12 @@ class FakeBee(QObject):
         self.mood_changed.emit(change)
         return change
 
+    def model(self, mood, angry_high):
+        """Как BeeWindow.apply_model_mood: настроение из тега ответа модели."""
+        change = self.engine.set_from_model(mood, angry_high)
+        self.mood_changed.emit(change)
+        return change
+
 
 class FakeWinapi:
     AVAILABLE = True
@@ -179,7 +185,7 @@ def make(qapp, windows=None, **kw):
     api = FakeWinapi(windows if windows is not None else [win(hwnd=7)])
     clock = Clock()
     params = dict(winapi_module=api, own_pid=OWN, rng=random.Random(1), clock=clock,
-                  countdown_s=3, tick_ms=10, cooldown_s=300, sting_ms=10, cancel_bubble_ms=10,
+                  countdown_s=3, tick_ms=10, cooldown_s=300, sting_ms=10,
                   screens_provider=lambda: [(QRect(0, 0, 1920, 1080), 1.0)])
     params.update(kw)
     ctl = BiteController(bee, **params)
@@ -208,11 +214,12 @@ def test_happy_path_closes_exactly_once(qapp):
     assert bee.flights[0] == QPoint(300 - 60, 100 - 120 + 30)
     bee.land()
     assert ctl.state == ctl.WARNING
-    assert bee.said[0].startswith("ВСЁ! это окно моё! 3…")
+    assert bee.said[0] == "3…"
     wait_state(ctl, ctl.IDLE)
     assert api.closed == [7]
-    assert bee.said[-1] == "бзз. так ему и надо 😤"
-    assert any("2…" in s for s in bee.said)
+    # пузырь — только обратный отсчёт, после укуса пчела молчит
+    assert bee.said == ["3…", "3…2…", "3…2…1…"]
+    assert all(re.fullmatch(r"(\d…)+", s) for s in bee.said)
     # тот же приступ: повторный angry-high ничего не делает
     bee.act(Action.FLOWER)
     bee.act(Action.SWAT)
@@ -228,7 +235,7 @@ def test_sorry_during_countdown_cancels(qapp):
     assert ctl.state == ctl.IDLE
     QTest.qWait(150)
     assert api.closed == []
-    assert bee.said[-1] == "ладно, живи... 🐝"
+    assert bee.said == ["3…"]  # отмена без реплики: отвечает модель
 
 
 def test_sorry_during_flight_cancels_flight(qapp):
@@ -363,3 +370,27 @@ def test_only_winapi_close_posts_messages():
         else:
             code = re.sub(r'""".*?"""|#.*', "", text, flags=re.S)
             assert not forbidden.search(code), path.name
+
+
+# --- настроение от модели ----------------------------------------------------
+
+def test_model_angry_high_starts_bite_and_model_neutral_cancels(qapp):
+    bee, api, clock, ctl = make(qapp, tick_ms=50)
+    bee.model(Mood.ANGRY, False)
+    assert ctl.state == ctl.IDLE
+    bee.model(Mood.ANGRY, True)  # модель ответила [angry:high]
+    assert ctl.state == ctl.FLYING and len(bee.flights) == 1
+    bee.land()
+    assert ctl.state == ctl.WARNING
+    bee.model(Mood.NEUTRAL, False)  # после sorry модель ответила [neutral:low]
+    assert ctl.state == ctl.IDLE
+    QTest.qWait(150)
+    assert api.closed == []
+
+
+def test_model_angry_high_closes_window(qapp):
+    bee, api, clock, ctl = make(qapp)
+    bee.model(Mood.ANGRY, True)
+    bee.land()
+    wait_state(ctl, ctl.IDLE)
+    assert api.closed == [7]

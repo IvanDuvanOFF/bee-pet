@@ -1,7 +1,8 @@
 """Тесты автомата настроения."""
 import pytest
 
-from bee_pet.mood import (ACTION_PHRASES, Action, Mood, MoodEngine, classify)
+from bee_pet.mood import (ACTION_PHRASES, ANGRY_HIGH_DECAY, Action, Mood, MoodEngine,
+                          classify, parse_mood_tag)
 
 
 class FakeClock:
@@ -141,3 +142,111 @@ def test_angry_decay_from_swat():
     eng, clock = angry()
     clock.t += 180
     assert eng.tick().new is Mood.NEUTRAL
+
+
+def test_provocation_while_angry_extends_decay():
+    """Злость отсчитывается от последней провокации, а не от первого шлепка."""
+    eng, clock = angry()          # t=1000: шлепок
+    eng.apply(Action.FLOWER)      # angry high
+    clock.t += 50
+    ch = eng.apply(Action.FLOWER)  # t=1050: ещё цветок — снова провокация
+    assert eng.changed_at == clock.t and not ch.became_angry_high
+    clock.t += 50                 # t=1100: прошло 100 с от начала, 50 от провокации
+    assert eng.tick() is None
+    assert eng.mood is Mood.ANGRY and eng.is_angry_high
+    clock.t += 9                  # 59 с от последней провокации
+    assert eng.tick() is None
+    clock.t += 1                  # 60 с
+    ch = eng.tick()
+    assert ch.new is Mood.ANGRY and not eng.is_angry_high
+
+
+@pytest.mark.parametrize("action", [Action.PET, Action.LOVE, Action.SWAT, Action.SPRAY])
+def test_escalator_while_angry_high_keeps_it(action):
+    eng, clock = angry()
+    eng.apply(Action.FLOWER)
+    clock.t += 30
+    ch = eng.apply(action)
+    assert ch.new is Mood.ANGRY and ch.angry_high and eng.changed_at == clock.t
+
+
+def test_angry_pet_never_turns_happy():
+    """Гладить злую пчелу можно сколько угодно: картинка остаётся злой, пока не затухнет."""
+    eng, clock = angry()
+    for _ in range(10):
+        clock.t += 100
+        eng.tick()
+        eng.apply(Action.PET)
+        assert eng.mood is Mood.ANGRY
+
+
+def test_other_while_angry_refreshes_plain_anger():
+    eng, clock = angry()
+    clock.t += 170
+    ch = eng.apply(Action.OTHER)
+    assert ch.new is Mood.ANGRY and not ch.angry_high and eng.changed_at == clock.t
+    clock.t += 179
+    assert eng.tick() is None
+    clock.t += 1
+    assert eng.tick().new is Mood.NEUTRAL
+
+
+def test_sorry_still_calms_angry_high():
+    eng, clock = angry()
+    eng.apply(Action.FLOWER)
+    ch = eng.apply(Action.SORRY)
+    assert ch.new is Mood.NEUTRAL and not eng.is_angry_high
+
+
+# --- настроение из тега модели -----------------------------------------------
+
+@pytest.mark.parametrize("raw, expected", [
+    ("[happy:low] bzz!", (Mood.HAPPY, False)),
+    ("[happy:high] bzz!", (Mood.HAPPY, False)),
+    ("[angry:low] BZZT", (Mood.ANGRY, False)),
+    ("[angry:high] *STINGS*", (Mood.ANGRY, True)),
+    ("  [ ANGRY : High ]BZZT", (Mood.ANGRY, True)),
+    ("[angry] bzz", (Mood.ANGRY, False)),
+    ("[confused] bzz?", (Mood.CONFUSED, False)),
+    ("[Loving:low] bzz", (Mood.LOVING, False)),
+    ("[neutral:low]", (Mood.NEUTRAL, False)),
+    ("[sad:high] bzz...", (Mood.SAD, False)),
+    ("[grumpy:high] bzz", None),
+    ("bzz [happy:low]", None),
+    ("bzz", None),
+    ("", None),
+])
+def test_parse_mood_tag(raw, expected):
+    assert parse_mood_tag(raw) == expected
+
+
+def test_set_from_model_sets_state_and_refreshes():
+    eng, clock = make()
+    clock.t += 5
+    change = eng.set_from_model(Mood.HAPPY, False)
+    assert (change.old, change.new, eng.mood) == (Mood.NEUTRAL, Mood.HAPPY, Mood.HAPPY)
+    assert eng.changed_at == clock.t
+    clock.t += 5
+    eng.set_from_model(Mood.HAPPY, False)  # то же настроение — таймер всё равно заново
+    assert eng.changed_at == clock.t
+
+
+def test_set_from_model_became_angry_high_once():
+    eng, clock = make()
+    first = eng.set_from_model(Mood.ANGRY, False)
+    assert not first.angry_high and not first.became_angry_high
+    high = eng.set_from_model(Mood.ANGRY, True)
+    assert high.angry_high and high.became_angry_high and eng.is_angry_high
+    again = eng.set_from_model(Mood.ANGRY, True)
+    assert again.angry_high and not again.became_angry_high
+    calm = eng.set_from_model(Mood.NEUTRAL, False)
+    assert calm.new is Mood.NEUTRAL and not eng.angry_high
+
+
+def test_set_from_model_high_only_for_angry_and_decays():
+    eng, clock = make()
+    assert not eng.set_from_model(Mood.HAPPY, True).angry_high
+    eng.set_from_model(Mood.ANGRY, True)
+    clock.t += ANGRY_HIGH_DECAY
+    change = eng.tick()
+    assert change is not None and change.new is Mood.ANGRY and not change.angry_high

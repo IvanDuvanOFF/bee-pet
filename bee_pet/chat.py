@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QHBoxLayout, QLineEdit, QPushButton, QTextBrowser
 from bee_pet.bee_window import BeeWindow
 from bee_pet.llm import BeeClient
 from bee_pet.mood import classify
+from bee_pet.mood_sync import MoodRequest, MoodSync
 
 CHAT_SIZE = (300, 360)
 OFFLINE_NOTE = "(пчела далеко, отвечает по памяти)"
@@ -20,11 +21,13 @@ TYPING_TEXT = "бзз…"
 class ChatWindow(QWidget):
     """Небольшое окно чата: история, поле ввода и кнопка отправки."""
 
-    def __init__(self, bee: BeeWindow, client: BeeClient) -> None:
+    def __init__(self, bee: BeeWindow, client: BeeClient,
+                 sync: MoodSync | None = None) -> None:
         super().__init__(None, Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setWindowTitle("Чат с пчелой 🐝")
         self.resize(*CHAT_SIZE)
         self._bee, self._client = bee, client
+        self._sync = sync if sync is not None else MoodSync(bee, client)
         self._tag = object()  # метка наших запросов среди ответов клиента
         self._entries: list[tuple[str, str]] = []  # (вид, текст)
         self._waiting = False
@@ -77,19 +80,18 @@ class ChatWindow(QWidget):
     # --- отправка и ответ --------------------------------------------------
 
     def send(self) -> None:
-        """Отправляет введённый текст: меняет настроение и спрашивает модель."""
+        """Отправляет введённый текст модели; настроение выставится по её ответу."""
         text = self.input.text().strip()
         if not text or self._waiting:
             return
         self.input.clear()
         self._entries.append(("user", text))
-        self._bee.apply_action(classify(text))  # без запроса к модели по меню-пути
         self._set_waiting(True)
         self._render()
-        self._client.request(text, tag=self._tag)
+        self._sync.request(text, classify(text), self._tag)
 
     def _on_reply(self, tag: object, text: str, from_model: bool) -> None:
-        if tag is not self._tag:
+        if not (isinstance(tag, MoodRequest) and tag.source is self._tag):
             return
         self._set_waiting(False)
         self._entries.append(("bee", text))

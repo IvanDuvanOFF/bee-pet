@@ -103,6 +103,27 @@ def classify(text: str) -> Action:
     return Action.OTHER
 
 
+# Ведущий тег настроения в ответе BeeLLM: «[angry:high] ...», «[ happy ] ...».
+_MOOD_TAG_RE = re.compile(r"^\s*\[\s*(\w+)\s*(?::\s*(\w+)\s*)?\]")
+
+
+def parse_mood_tag(raw: str) -> tuple[Mood, bool] | None:
+    """Разбирает ведущий тег «[mood:level]» ответа модели.
+
+    Возвращает (настроение, angry_high), где angry_high — это angry с уровнем high;
+    уровень остальных настроений не важен. Без тега или с незнакомым настроением — None.
+    """
+    m = _MOOD_TAG_RE.match(raw or "")
+    if m is None:
+        return None
+    try:
+        mood = Mood(m.group(1).lower())
+    except ValueError:
+        return None
+    level = (m.group(2) or "").lower()
+    return mood, mood is Mood.ANGRY and level == "high"
+
+
 @dataclass(frozen=True)
 class MoodChange:
     """Результат смены настроения."""
@@ -127,7 +148,7 @@ _ANGRY_ESCALATORS = {Action.FLOWER, Action.LOVE, Action.PET, Action.SWAT, Action
 
 
 class MoodEngine:
-    """Детерминированный автомат настроения."""
+    """Автомат настроения: вердикт модели или локальные правила без неё."""
 
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
@@ -140,29 +161,46 @@ class MoodEngine:
         """Сильно ли злится пчела."""
         return self.angry_high
 
-    def _set(self, mood: Mood, angry_high: bool) -> MoodChange:
-        """Применяет состояние; время сбрасывается, только если что-то изменилось."""
+    def _set(self, mood: Mood, angry_high: bool, refresh: bool = False) -> MoodChange:
+        """Применяет состояние; время сбрасывается, если что-то изменилось или refresh=True."""
         old, was_high = self.mood, self.angry_high
-        if (mood, angry_high) != (old, was_high):
+        if refresh or (mood, angry_high) != (old, was_high):
             self.changed_at = self._clock()
         self.mood, self.angry_high = mood, angry_high
         return MoodChange(old, mood, angry_high, angry_high and not was_high)
 
     def apply(self, action: Action) -> MoodChange:
-        """Применяет действие по таблице переходов."""
+        """Применяет действие по таблице переходов (запасной путь, когда модели нет).
+
+        Злая пчела успокаивается только от SORRY (-> NEUTRAL). Цветок, любовь,
+        поглаживание, шлепок и дихлофос злят сильнее (angry high), а всё остальное
+        оставляет злость как есть. Любое действие, после которого пчела всё ещё злится,
+        перезапускает таймеры затухания злости: они отсчитываются от последней провокации.
+        """
         if self.mood is Mood.ANGRY:
             if action is Action.SORRY:
                 return self._set(Mood.NEUTRAL, False)
             if action in _ANGRY_ESCALATORS:
-                return self._set(Mood.ANGRY, True)
-            return self._set(self.mood, self.angry_high)
+                return self._set(Mood.ANGRY, True, refresh=True)
+            return self._set(Mood.ANGRY, self.angry_high, refresh=True)
         new = _CALM_TRANSITIONS.get(action)
         if new is None:
             return self._set(self.mood, self.angry_high)
         return self._set(new, False)
 
+    def set_from_model(self, mood: Mood, angry_high: bool) -> MoodChange:
+        """Ставит настроение, которое назвала модель в теге ответа.
+
+        Таймеры затухания всегда отсчитываются заново, от последнего вердикта модели.
+        """
+        return self._set(mood, mood is Mood.ANGRY and angry_high, refresh=True)
+
     def tick(self) -> MoodChange | None:
-        """Затухание настроения; вызывается GUI периодически."""
+        """Затухание настроения; вызывается GUI периодически.
+
+        angry high -> angry через ANGRY_HIGH_DECAY, angry -> neutral через ANGRY_DECAY,
+        прочие настроения -> neutral через OTHER_MOOD_DECAY (от последней смены или провокации).
+        """
         if self.mood is Mood.NEUTRAL:
             return None
         elapsed = self._clock() - self.changed_at

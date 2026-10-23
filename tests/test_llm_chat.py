@@ -13,12 +13,13 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from bee_pet import llm
-from bee_pet.app import wire_menu_replies
+from bee_pet.app import wire_history_reset, wire_menu_replies
 from bee_pet.bee_window import BeeWindow
 from bee_pet.chat import OFFLINE_NOTE, ChatWindow
 from bee_pet.llm import (FALLBACK_BUZZ, HISTORY_TURNS, BeeClient, ask_bee, clean_reply,
                           strip_mood_tag)
 from bee_pet.mood import Action, Mood
+from bee_pet.mood_sync import MoodRequest
 
 
 @pytest.fixture(scope="session")
@@ -325,12 +326,20 @@ class FakeClient(BeeClient):
     def __init__(self):
         super().__init__()
         self.requests = []
+        self.offline = False
 
-    def request(self, prompt, tag=None):
+    def likely_online(self):
+        return not self.offline
+
+    def request(self, prompt, tag=None, remember=True):
         self.requests.append((prompt, tag))
 
-    def answer(self, text, from_model=True):
-        self.reply_ready.emit(self.requests[-1][1], text, from_model)
+    def answer(self, text, from_model=True, mood=None, high=False, tag=None):
+        """Ответ на последний (или указанный) запрос; mood — тег модели перед ответом."""
+        tag = self.requests[-1][1] if tag is None else tag
+        if mood is not None:
+            self.mood_ready.emit(tag, mood, high)
+        self.reply_ready.emit(tag, text, from_model)
 
 
 @pytest.fixture
@@ -352,13 +361,15 @@ def test_chat_send_flow(chat_env):
     chat.input.setText("*gives you a flower*")
     chat.send()
     assert client.requests[0][0] == "*gives you a flower*"
-    assert bee.engine.mood is Mood.HAPPY
+    assert client.requests[0][1].action is Action.FLOWER
+    assert bee.engine.mood is Mood.NEUTRAL  # ждём ответа модели
     assert not chat.input.isEnabled()
     assert "бзз…" in chat.history.toPlainText()
     chat.send()  # во время ожидания повторная отправка игнорируется
     assert len(client.requests) == 1
 
-    client.answer("ура!")
+    client.answer("ура!")  # без тега — локальное правило
+    assert bee.engine.mood is Mood.HAPPY
     assert chat.input.isEnabled()
     text = chat.history.toPlainText()
     assert "Ты: *gives you a flower*" in text and "🐝 ура!" in text
@@ -398,6 +409,7 @@ def test_chat_mood_via_classify_does_not_emit_action_performed(chat_env):
     bee.action_performed.connect(emitted.append)
     chat.input.setText("*swats you*")
     chat.send()
+    client.answer("BZZT", mood=Mood.ANGRY)
     assert bee.engine.mood is Mood.ANGRY and emitted == []
 
 
@@ -407,9 +419,254 @@ def test_menu_wiring_requests_and_shows_model_reply(qapp, tmp_path):
     wire_menu_replies(bee, client)
     bee.menu_actions[Action.PET].trigger()
     assert client.requests[0][0] == "*pets you*"
-    canned = bee.bubble.text
-    client.answer("мррр", from_model=False)
-    assert bee.bubble.text == canned
+    assert not bee.bubble.isVisible()  # заготовок нет: ждём ответ
     client.answer("мррр", from_model=True)
     assert bee.bubble.text == "🐝 мррр"
     bee.bubble.hide()
+
+
+def test_menu_wiring_offline_shows_fallback_buzz(qapp, tmp_path):
+    bee = BeeWindow(settings=QSettings(str(tmp_path / "o.ini"), QSettings.IniFormat))
+    client = FakeClient()
+    wire_menu_replies(bee, client)
+    bee.menu_actions[Action.SWAT].trigger()
+    buzz = FALLBACK_BUZZ[0]
+    client.answer(buzz, from_model=False)
+    assert bee.bubble.isVisible() and bee.bubble.text == f"🐝 {buzz}"
+    bee.bubble.hide()
+
+
+def test_jitter_swat_requests_model(qapp, tmp_path):
+    bee = BeeWindow(settings=QSettings(str(tmp_path / "j.ini"), QSettings.IniFormat))
+    client = FakeClient()
+    wire_menu_replies(bee, client)
+    bee._on_menu_action(Action.SWAT)  # путь мельтешения курсором
+    [(prompt, tag)] = client.requests
+    assert prompt == "*swats you*"
+    assert isinstance(tag, MoodRequest) and (tag.source, tag.action) == ("menu", Action.SWAT)
+
+
+# --- сброс истории при затухании ---------------------------------------------
+
+def test_client_clear_history(qapp):
+    seen = []
+
+    def ask(messages):
+        seen.append(messages)
+        return "[angry:high] *STINGS YOU*"
+
+    client = BeeClient(ask=ask)
+    got = []
+    client.reply_ready.connect(lambda *a: got.append(a))
+    client.request("*swats you*")
+    _wait_count(got, 1)
+    client.clear_history()
+    client.request("*pets you*")
+    _wait_count(got, 2)
+    client.shutdown()
+    assert seen[1] == [{"role": "user", "content": "*pets you*"}]
+
+
+class _HistoryClient(BeeClient):
+    def __init__(self):
+        super().__init__()
+        self.cleared = 0
+
+    def clear_history(self):
+        self.cleared += 1
+
+
+def test_history_reset_on_decay_to_neutral(qapp, tmp_path):
+    from bee_pet.mood import ANGRY_DECAY, ANGRY_HIGH_DECAY, MoodEngine
+    now = [1000.0]
+    clock = lambda: now[0]
+    bee = BeeWindow(settings=QSettings(str(tmp_path / "h.ini"), QSettings.IniFormat),
+                    engine=MoodEngine(clock), clock=clock)
+    client = _HistoryClient()
+    wire_history_reset(bee, client)
+    bee.apply_action(Action.SWAT)
+    bee.apply_action(Action.FLOWER)       # angry high
+    now[0] += ANGRY_HIGH_DECAY
+    bee._on_mood_tick()                   # angry high -> angry: модель ещё злится
+    assert bee.engine.mood is Mood.ANGRY and client.cleared == 0
+    now[0] += ANGRY_DECAY
+    bee._on_mood_tick()                   # angry -> neutral: история забыта
+    assert bee.engine.mood is Mood.NEUTRAL and client.cleared == 1
+
+
+def test_history_kept_after_sorry(qapp, tmp_path):
+    bee = BeeWindow(settings=QSettings(str(tmp_path / "s.ini"), QSettings.IniFormat))
+    client = _HistoryClient()
+    wire_history_reset(bee, client)
+    bee.apply_action(Action.SWAT)
+    bee.apply_action(Action.SORRY)
+    assert bee.engine.mood is Mood.NEUTRAL and client.cleared == 0
+
+
+# --- настроение по ответу модели ---------------------------------------------
+
+def test_client_mood_ready_before_reply_only_for_tagged_model_replies(qapp):
+    answers = iter(["[Angry : HIGH] BZZT", "без тега", "[grumpy:low] bzz",
+                    ConnectionRefusedError()])
+
+    def ask(messages):
+        a = next(answers)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    client = BeeClient(ask=ask, backoff=0)
+    events, replies = [], []
+    client.mood_ready.connect(lambda tag, mood, high: events.append(("mood", tag, mood, high)))
+    client.reply_ready.connect(lambda tag, text, fm: events.append(("reply", tag, fm)))
+    client.reply_ready.connect(lambda *a: replies.append(a))
+    for i in range(4):
+        client.request("x", tag=i)
+        _wait_count(replies, i + 1)
+    client.shutdown()
+    assert events == [("mood", 0, Mood.ANGRY, True), ("reply", 0, True),
+                      ("reply", 1, True), ("reply", 2, True), ("reply", 3, False)]
+
+
+def test_client_likely_online(qapp):
+    now = [100.0]
+    client = BeeClient(ask=lambda m: "", clock=lambda: now[0], backoff=30)
+    assert client.likely_online()  # ещё не спрашивали
+    client._on_done(None, "бзз", False, "hi", "", True)
+    assert not client.likely_online()
+    now[0] = 131.0
+    assert client.likely_online()  # пауза прошла: пробуем снова
+
+
+@pytest.fixture
+def menu_env(qapp, tmp_path):
+    bee = BeeWindow(settings=QSettings(str(tmp_path / "mm.ini"), QSettings.IniFormat))
+    client = FakeClient()
+    wire_menu_replies(bee, client)
+    changes = []
+    bee.mood_changed.connect(changes.append)
+    yield bee, client, changes
+    bee.bubble.hide()
+    bee.close()
+
+
+def test_menu_online_mood_waits_for_reply_and_follows_tag(menu_env):
+    bee, client, changes = menu_env
+    bee.menu_actions[Action.SWAT].trigger()
+    assert bee.engine.mood is Mood.NEUTRAL and changes == []
+    client.answer("bzz~", mood=Mood.HAPPY)  # модель решила не злиться
+    assert bee.engine.mood is Mood.HAPPY and len(changes) == 1
+    assert bee.bubble.text == "🐝 bzz~"
+
+
+def test_menu_online_model_angry_high(menu_env):
+    bee, client, changes = menu_env
+    bee.menu_actions[Action.FLOWER].trigger()
+    client.answer("BZZT", mood=Mood.ANGRY, high=True)
+    assert bee.engine.mood is Mood.ANGRY and bee.engine.angry_high
+    assert changes[-1].became_angry_high
+
+
+def test_menu_fallback_reply_applies_local_rule_once(menu_env):
+    bee, client, changes = menu_env
+    bee.menu_actions[Action.SWAT].trigger()
+    assert changes == []
+    client.answer(FALLBACK_BUZZ[0], from_model=False)
+    assert bee.engine.mood is Mood.ANGRY and not bee.engine.angry_high
+    assert len(changes) == 1
+
+
+def test_menu_unparsable_tag_applies_local_rule(menu_env):
+    bee, client, changes = menu_env
+    bee.menu_actions[Action.SPRAY].trigger()
+    client.answer("bzz", from_model=True)  # модель ответила, но mood_ready не было
+    assert bee.engine.mood is Mood.SAD and len(changes) == 1
+
+
+def test_menu_offline_applies_local_rule_immediately_not_twice(menu_env):
+    bee, client, changes = menu_env
+    client.offline = True
+    bee.menu_actions[Action.SWAT].trigger()
+    assert bee.engine.mood is Mood.ANGRY and len(changes) == 1
+    bee.menu_actions[Action.FLOWER].trigger()
+    assert bee.engine.angry_high and len(changes) == 2
+    client.answer(FALLBACK_BUZZ[0], from_model=False, tag=client.requests[0][1])
+    client.answer(FALLBACK_BUZZ[1], from_model=False)
+    assert bee.engine.angry_high and len(changes) == 2
+
+
+def test_jitter_swat_waits_for_model(menu_env):
+    bee, client, changes = menu_env
+    bee._on_menu_action(Action.SWAT)  # путь мельтешения курсором
+    assert bee.engine.mood is Mood.NEUTRAL
+    client.answer("BZZT", mood=Mood.ANGRY)
+    assert bee.engine.mood is Mood.ANGRY
+
+
+def test_chat_online_follows_model_tag(chat_env):
+    bee, client, chat = chat_env
+    chat.input.setText("*gives you a flower*")
+    chat.send()
+    assert bee.engine.mood is Mood.NEUTRAL
+    client.answer("hmm", mood=Mood.CONFUSED)
+    assert bee.engine.mood is Mood.CONFUSED
+
+
+def test_chat_fallback_and_offline_local_rule_once(chat_env):
+    bee, client, chat = chat_env
+    changes = []
+    bee.mood_changed.connect(changes.append)
+    chat.input.setText("i love you")
+    chat.send()
+    client.answer("бзз", from_model=False)
+    assert bee.engine.mood is Mood.LOVING and len(changes) == 1
+    client.offline = True
+    chat.input.setText("*sprays you with bug spray*")
+    chat.send()
+    assert bee.engine.mood is Mood.SAD and len(changes) == 2
+    client.answer("бзз", from_model=False)
+    assert len(changes) == 2
+
+
+def test_foreign_replies_do_not_touch_mood(menu_env):
+    bee, client, changes = menu_env
+    client.mood_ready.emit(("wander", 1), Mood.ANGRY, True)
+    client.reply_ready.emit(("wander", 1), "bzz", True)
+    client.mood_ready.emit("t", Mood.SAD, False)
+    client.reply_ready.emit("t", "bzz", False)
+    assert bee.engine.mood is Mood.NEUTRAL and changes == []
+
+
+def test_wander_buzz_never_changes_mood(qapp, tmp_path):
+    from bee_pet.wander import WanderController
+    bee = BeeWindow(settings=QSettings(str(tmp_path / "w.ini"), QSettings.IniFormat))
+    client = BeeClient(ask=lambda m: "[angry:high] BZZZT")
+    wire_menu_replies(bee, client)
+    chat = ChatWindow(bee, client)
+    wander = WanderController(bee, client)
+    got = []
+    client.reply_ready.connect(lambda *a: got.append(a))
+    wander._request_buzz()
+    _wait_count(got, 1)
+    client.shutdown()
+    assert got[0][2] is True
+    assert bee.engine.mood is Mood.NEUTRAL and not bee.engine.angry_high
+    chat.hide()
+    bee.bubble.hide()
+    bee.close()
+
+
+def test_real_client_menu_flow_follows_tag(qapp, tmp_path):
+    bee = BeeWindow(settings=QSettings(str(tmp_path / "r.ini"), QSettings.IniFormat))
+    client = BeeClient(ask=lambda m: "[happy:low] bzz!")
+    wire_menu_replies(bee, client)
+    got = []
+    client.reply_ready.connect(lambda *a: got.append(a))
+    bee.menu_actions[Action.SWAT].trigger()
+    assert bee.engine.mood is Mood.NEUTRAL
+    _wait_count(got, 1)
+    client.shutdown()
+    assert bee.engine.mood is Mood.HAPPY
+    assert bee.bubble.text == "🐝 bzz!"
+    bee.bubble.hide()
+    bee.close()

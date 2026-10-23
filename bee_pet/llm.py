@@ -12,6 +12,8 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
 
+from bee_pet.mood import parse_mood_tag
+
 BEE_URL = os.environ.get("BEE_URL", "http://127.0.0.1:8081")
 
 MAX_REPLY_CHARS = 200
@@ -121,6 +123,8 @@ class BeeClient(QObject):
     """
 
     reply_ready = Signal(object, str, bool)  # tag, text, from_model
+    # tag, Mood, angry_high: настроение из тега ответа модели, приходит перед reply_ready
+    mood_ready = Signal(object, object, bool)
 
     def __init__(self, ask: Callable[[Messages], str] = ask_bee,
                  clock: Callable[[], float] = time.monotonic,
@@ -147,13 +151,17 @@ class BeeClient(QObject):
         messages.append({"role": "user", "content": prompt})
         return messages
 
+    def likely_online(self) -> bool:
+        """False, только если недавний сбой и пауза перед новой попыткой ещё идёт."""
+        return not (self.online is False and self._clock() < self._offline_until)
+
     def request(self, prompt: str, tag: object = None, remember: bool = True) -> None:
         """Запрашивает ответ; при недавнем сбое сразу отвечает заготовкой.
 
         remember=False — разовая реплика: модель получает только её (без истории),
         и ответ в историю не попадает (например, жужжание в полёте).
         """
-        if self.online is False and self._clock() < self._offline_until:
+        if not self.likely_online():
             text = random_fallback()
             QTimer.singleShot(0, lambda: self.reply_ready.emit(tag, text, False))
             return
@@ -172,7 +180,14 @@ class BeeClient(QObject):
         else:
             # Заготовки в историю не попадают: модель их не говорила.
             self._offline_until = self._clock() + self._backoff
+        parsed = parse_mood_tag(raw) if from_model else None
+        if parsed is not None:
+            self.mood_ready.emit(tag, *parsed)
         self.reply_ready.emit(tag, text, from_model)
+
+    def clear_history(self) -> None:
+        """Забывает диалог: пчела успокоилась и не помнит прошлых обид."""
+        self._history.clear()
 
     def shutdown(self) -> None:
         """Дожидается воркеров (для выхода из приложения и тестов)."""

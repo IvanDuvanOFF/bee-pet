@@ -46,7 +46,6 @@ TOP_CHOICES = 3
 COUNTDOWN_S = 5
 COOLDOWN_S = 5 * 60.0
 STING_MS = 400
-CANCEL_BUBBLE_DELAY_MS = 1500  # чтобы реакция на «sorry» не затёрла реплику сразу
 
 Rect = tuple[int, int, int, int]
 
@@ -167,7 +166,6 @@ class BiteController(QObject):
                  rng: random.Random | None = None, clock: Callable[[], float] = time.monotonic,
                  countdown_s: int = COUNTDOWN_S, tick_ms: int = 1000,
                  cooldown_s: float = COOLDOWN_S, sting_ms: int = STING_MS,
-                 cancel_bubble_ms: int = CANCEL_BUBBLE_DELAY_MS,
                  screens_provider: Callable[[], list[tuple[QRect, float]]] = qt_screens) -> None:
         super().__init__(bee)
         self._bee = bee
@@ -179,7 +177,6 @@ class BiteController(QObject):
         self._countdown_s = countdown_s
         self._cooldown_s = cooldown_s
         self._sting_ms = sting_ms
-        self._cancel_bubble_ms = cancel_bubble_ms
         self._screens_provider = screens_provider
 
         self.state = self.IDLE
@@ -207,7 +204,7 @@ class BiteController(QObject):
         if change.new is not Mood.ANGRY:
             self._bitten_this_episode = False  # приступ закончился
         if self.state != self.IDLE and not change.angry_high:
-            self._cancel("настроение больше не angry-high", mood_message=True)
+            self._cancel("настроение больше не angry-high")
         if change.became_angry_high:
             self._try_start()
 
@@ -272,7 +269,7 @@ class BiteController(QObject):
 
     def _countdown_text(self) -> str:
         done = range(self._countdown_s, self._left - 1, -1)
-        return "ВСЁ! это окно моё! " + "…".join(str(n) for n in done) + "…"
+        return "…".join(str(n) for n in done) + "…"
 
     def _announce(self) -> None:
         self._bee.say(self._countdown_text(), 1500)
@@ -311,7 +308,6 @@ class BiteController(QObject):
         self._last_bite = self._clock()
         self._bitten_this_episode = True
         self._reset()
-        self._bee.say("бзз. так ему и надо 😤", 4000)
 
     # --- проверки и отмена -------------------------------------------------
 
@@ -335,17 +331,11 @@ class BiteController(QObject):
             return "окно сдвинулось"
         return None
 
-    def _cancel(self, reason: str, mood_message: bool = False) -> None:
+    def _cancel(self, reason: str) -> None:
         log.info("отмена укуса: %s", reason)
         if self.state == self.FLYING:
             self._bee.cancel_flight()
         self._reset()
-        if mood_message:
-            QTimer.singleShot(self._cancel_bubble_ms, self._say_forgiven)
-
-    def _say_forgiven(self) -> None:
-        if self.state == self.IDLE:
-            self._bee.say("ладно, живи... 🐝", 3000)
 
     def _reset(self) -> None:
         self._tick_timer.stop()

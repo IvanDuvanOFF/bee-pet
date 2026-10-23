@@ -48,18 +48,54 @@ def test_apply_action_changes_mood_and_emits(bee):
     assert changes and changes[-1].new is Mood.HAPPY
 
 
-def test_menu_action_emits_and_says(bee):
+def test_apply_model_mood_changes_mood_and_emits(bee):
+    changes = []
+    bee.mood_changed.connect(changes.append)
+    bee.apply_model_mood(Mood.ANGRY, True)
+    assert bee.engine.mood is Mood.ANGRY and bee.engine.angry_high
+    assert changes[-1].became_angry_high
+
+
+def test_menu_action_deferred_mood_untouched(bee):
+    performed = []
+    bee.action_performed.connect(performed.append)
+    bee.mood_deferred = True  # настроение выставит ответ модели
+    bee.menu_actions[Action.SWAT].trigger()
+    assert performed == [Action.SWAT] and bee.engine.mood is Mood.NEUTRAL
+
+
+def test_menu_action_emits_without_canned_line(bee):
     performed = []
     bee.action_performed.connect(performed.append)
     bee.menu_actions[Action.SWAT].trigger()
     assert performed == [Action.SWAT]
     assert bee.engine.mood is Mood.ANGRY
-    assert bee.bubble.isVisible() and bee.bubble.text == "БЗЗ!! 😠"
+    assert not bee.bubble.isVisible()  # реплику покажет ответ модели, не заготовка
     bee.menu_actions[Action.FLOWER].trigger()
     assert bee.engine.angry_high
-    assert bee.bubble.text == "не подлизывайся! 😡"
+    bee.menu_actions[Action.PET].trigger()
+    assert bee.engine.mood is Mood.ANGRY and bee.engine.angry_high
     bee.menu_actions[Action.SORRY].trigger()
     assert bee.engine.mood is Mood.NEUTRAL
+    assert performed == [Action.SWAT, Action.FLOWER, Action.PET, Action.SORRY]
+    assert not bee.bubble.isVisible()
+
+
+def test_mood_decay_emits_mood_decayed(qapp, settings):
+    from bee_pet.mood import ANGRY_DECAY, MoodEngine
+    clock = _Clock()
+    w = BeeWindow(settings=settings, engine=MoodEngine(clock), clock=clock)
+    decayed, changed = [], []
+    w.mood_decayed.connect(decayed.append)
+    w.mood_changed.connect(changed.append)
+    w.apply_action(Action.SWAT)
+    assert decayed == []  # действие — не затухание
+    w._on_mood_tick()
+    assert decayed == []
+    clock.t += ANGRY_DECAY
+    w._on_mood_tick()
+    assert len(decayed) == 1 and decayed[0].new is Mood.NEUTRAL
+    assert changed[-1] is decayed[0]
 
 
 def test_biting_default_and_persist(qapp, settings):
@@ -216,7 +252,6 @@ def test_jitter_over_bee_is_swat(qapp, settings):
     _rub(w, clock)
     assert performed == [Action.SWAT]
     assert w.engine.mood is Mood.ANGRY
-    assert w.bubble.text == "БЗЗ!! 😠"
     # пауза: продолжение мельтешения сразу не даёт второго шлепка
     _rub(w, clock)
     assert performed == [Action.SWAT]
