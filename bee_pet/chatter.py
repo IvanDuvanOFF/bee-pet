@@ -132,20 +132,31 @@ class ChatterController(QObject):
 
     def _ping(self) -> None:
         self.schedule()
+        self._send_ping()
+
+    def ping_now(self) -> bool:
+        """Жужжит прямо сейчас (например, пчела пошла пешком), не трогая расписание.
+
+        Действуют те же правила пропуска, что и для пингов по таймеру. True, если пинг ушёл.
+        """
+        return self._send_ping()
+
+    def _send_ping(self) -> bool:
         if self._pending_since is not None:
             if self._clock() - self._pending_since < self._pending_timeout_s:
                 log.debug("не жужжу: прошлый пинг ещё ждёт ответа")
-                return
+                return False
             log.info("ответ на пинг потерялся, пингую заново")
         reason = self._blocked()
         if reason:
             log.debug("не жужжу: %s", reason)
-            return
+            return False
         self._seq += 1
         self._pending_since = self._clock()
         self.pings += 1
         self._client.request(PING_PROMPT, tag=(CHATTER_TAG, self._seq),
                              remember=False, use_history=True)
+        return True
 
     def on_reply(self, tag: object, text: str, from_model: bool) -> None:  # noqa: ARG002
         """Ответ на пинг (или заготовка без сервера) — в пузырь; настроение не трогаем."""

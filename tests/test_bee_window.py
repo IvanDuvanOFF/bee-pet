@@ -317,3 +317,108 @@ def test_focus_switch_default_and_persist(qapp, settings):
     w.focus_switch_action.setChecked(False)
     assert got == [False] and not w.focus_switch_enabled
     assert BeeWindow(settings=settings).focus_switch_enabled is False
+
+
+# --- поза «сидит/идёт» и ходьба -------------------------------------------------
+
+from bee_pet.painter import FEET_Y, feet_y
+
+
+def _render(state, size=120):
+    img = QImage(size, size, QImage.Format_ARGB32)
+    img.fill(QColor(0, 0, 0, 0))
+    p = QPainter(img)
+    paint_bee(p, QRectF(0, 0, size, size), state)
+    p.end()
+    return img
+
+
+def _lowest_opaque_row(img):
+    return max(y for y in range(img.height()) for x in range(img.width())
+               if img.pixelColor(x, y).alpha() > 40)
+
+
+@pytest.mark.parametrize("facing", [-1, 1])
+@pytest.mark.parametrize("pose", [dict(perched=True), dict(walking=True),
+                                  dict(perched=True, walking=True, phase=0.1)])
+@pytest.mark.parametrize("mood", [Mood.NEUTRAL, Mood.CONFUSED, Mood.LOVING])
+def test_painter_perched_and_walking_poses(qapp, facing, pose, mood):
+    state = PaintState(**dict(dict(phase=0.7, mood=mood, facing=facing), **pose))
+    img = _render(state)
+    assert any(img.pixelColor(x, 60).alpha() > 0 for x in range(120))
+
+
+def test_feet_offset_sane(qapp):
+    feet = feet_y(120)
+    assert feet == round(FEET_Y) == 102
+    assert 96 < feet < 120  # ниже тела (низ тела — 96), но внутри окна
+    assert abs(feet_y(240) - 2 * FEET_Y) <= 1
+    # в позе «сидит» нижний край рисунка — это и есть лапки
+    for facing in (-1, 1):
+        low = _lowest_opaque_row(_render(PaintState(perched=True, facing=facing)))
+        assert feet - 3 <= low <= feet
+
+
+def test_facing_mirrors_drawing(qapp):
+    left = _render(PaintState(perched=True, facing=-1))
+    right = _render(PaintState(perched=True, facing=1))
+    assert left != right
+    # с точностью до сглаживания и полупикселя правая — зеркальная копия левой
+    differ = sum(1 for y in range(120) for x in range(120)
+                 if abs(left.pixelColor(119 - x, y).alpha() - right.pixelColor(x, y).alpha()) > 128)
+    same = sum(1 for y in range(120) for x in range(120)
+               if abs(left.pixelColor(x, y).alpha() - right.pixelColor(x, y).alpha()) > 128)
+    assert differ < same / 5
+
+
+def test_walk_to_moves_horizontally_at_speed(qapp, settings):
+    clock = _Clock()
+    w = BeeWindow(settings=settings, clock=clock)
+    w.move(500, 300)
+    arrived = []
+    assert w.walk_to(580, lambda: arrived.append(True), speed=40.0)
+    assert w.is_walking and w.facing == 1
+    clock.t += 1.0
+    w._on_walk_tick()
+    assert w.pos() == QPoint(540, 300) and arrived == []
+    clock.t += 0.5
+    w._on_walk_tick()
+    assert w.pos() == QPoint(560, 300)
+    clock.t += 1.0
+    w._on_walk_tick()
+    assert w.pos() == QPoint(580, 300) and arrived == [True] and not w.is_walking
+    assert w.walk_to(500) and w.facing == -1
+    w.stop_walking()
+    assert not w.is_walking and w.pos() == QPoint(580, 300)
+
+
+def test_walk_to_real_time(bee):
+    start = bee.pos()
+    arrived = []
+    bee.walk_to(start.x() + 20, lambda: arrived.append(True), speed=40.0)
+    QTest.qWait(250)
+    assert arrived == [] and start.x() < bee.x() < start.x() + 20
+    for _ in range(200):
+        if arrived:
+            break
+        QTest.qWait(10)
+    assert arrived == [True] and bee.pos() == start + QPoint(20, 0)
+
+
+def test_fly_to_and_drag_cancel_walk_and_perch(bee):
+    arrived = []
+    bee.perched = True
+    bee.walk_to(bee.x() + 200, lambda: arrived.append(True))
+    bee.fly_to(bee.pos() + QPoint(0, -40))
+    assert not bee.is_walking and not bee.perched
+    bee.cancel_flight()
+    bee.perched = True
+    bee.walk_to(bee.x() + 200, lambda: arrived.append(True))
+    QTest.mousePress(bee, Qt.LeftButton, pos=QPoint(60, 60))
+    QTest.mouseMove(bee, QPoint(90, 90))
+    QTest.mouseMove(bee, QPoint(100, 100))
+    assert bee.is_dragging and not bee.is_walking and not bee.perched
+    assert not bee.walk_to(bee.x() + 50)  # в руках не ходит
+    QTest.mouseRelease(bee, Qt.LeftButton, pos=QPoint(100, 100))
+    QTest.qWait(100)
+    assert arrived == []

@@ -14,13 +14,14 @@ from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from bee_pet.bubble import SpeechBubble
 from bee_pet.mood import Action, Mood, MoodChange, MoodEngine
-from bee_pet.painter import PaintState, paint_bee
+from bee_pet.painter import PaintState, feet_y, paint_bee
 
 WINDOW_SIZE = 120
 SCREEN_MARGIN = 24
 FRAME_MS = 33
 DRAG_THRESHOLD = 4
 FLIGHT_SPEED = 400.0  # px/с
+WALK_SPEED = 40.0     # px/с: пешком по кромке окна или панели задач
 
 # «Мельтешение» курсором над пчелой считается шлепком.
 JITTER_WINDOW_S = 1.0      # скользящее окно наблюдения, с
@@ -94,6 +95,8 @@ class BeeWindow(QWidget):
     chat_requested = Signal()
     biting_toggled = Signal(bool)
     focus_switch_toggled = Signal(bool)
+    icon_prank_toggled = Signal(bool)
+    icon_restore_requested = Signal()
     drag_started = Signal()
     drag_finished = Signal()  # кнопку отпустили после настоящего перетаскивания
 
@@ -109,6 +112,10 @@ class BeeWindow(QWidget):
         self._settings = settings if settings is not None else QSettings("bee-pet", "bee-pet")
         self._biting = self._settings.value("biting_enabled", True, type=bool)
         self._focus_switch = self._settings.value("focus_switch_enabled", True, type=bool)
+        self._icon_prank = self._settings.value("icon_prank_enabled", False, type=bool)
+        # Кто сейчас ведёт пчелу помимо прогулок и ходьбы (например, перенос ярлыка);
+        # пока не None, WanderController и WalkController её не двигают.
+        self.occupied_by: str | None = None
         self.engine = engine if engine is not None else MoodEngine()
         # True — настроение по командам меню выставляет MoodSync по ответу модели;
         # False (пчела без клиента) — сразу по локальным правилам.
@@ -124,6 +131,13 @@ class BeeWindow(QWidget):
         self._press_pos = QPoint()
         self._flight: QPropertyAnimation | None = None
         self._on_arrived: Callable[[], None] | None = None
+        self._facing = -1  # -1 — голова слева (как нарисовано), +1 — справа
+        self._perched = False
+        self._walk_target: int | None = None
+        self._walk_speed = WALK_SPEED
+        self._walk_last = 0.0
+        self._walk_x = 0.0  # точная (дробная) позиция в пути, чтобы скорость не терялась
+        self._on_walked: Callable[[], None] | None = None
         self._clock = clock
         self._jitter = JitterDetector()
         self._jitter_cooldown_until = -math.inf
@@ -133,6 +147,9 @@ class BeeWindow(QWidget):
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._on_frame)
         self._anim_timer.start(FRAME_MS)
+        self._walk_timer = QTimer(self)
+        self._walk_timer.setInterval(FRAME_MS)
+        self._walk_timer.timeout.connect(self._on_walk_tick)
         self._mood_timer = QTimer(self)
         self._mood_timer.timeout.connect(self._on_mood_tick)
         self._mood_timer.start(1000)
@@ -163,6 +180,35 @@ class BeeWindow(QWidget):
         self._settings.sync()
         self.focus_switch_toggled.emit(value)
 
+    @property
+    def icon_prank_enabled(self) -> bool:
+        """Разрешено ли таскать ярлыки на рабочем столе от скуки."""
+        return self._icon_prank
+
+    def _set_icon_prank(self, value: bool) -> None:
+        self._icon_prank = value
+        self._settings.setValue("icon_prank_enabled", value)
+        self._settings.sync()
+        self.icon_prank_toggled.emit(value)
+
+    @property
+    def settings(self) -> QSettings:
+        """Настройки пчелы (выключатели, записи контроллеров)."""
+        return self._settings
+
+    def set_icon_prank_available(self, available: bool) -> None:
+        """Без значков рабочего стола (не Windows) пункты ярлыков неактивны."""
+        self.icon_prank_action.setEnabled(available)
+        tip = "" if available else "Только на Windows"
+        self.icon_prank_action.setToolTip(tip)
+        self.icon_restore_action.setToolTip(tip)
+        if not available:
+            self.icon_restore_action.setEnabled(False)
+
+    def set_icons_restorable(self, restorable: bool) -> None:
+        """Есть ли ярлыки, которые можно вернуть на место."""
+        self.icon_restore_action.setEnabled(restorable and self.icon_prank_action.isEnabled())
+
     # --- меню --------------------------------------------------------------
 
     def _build_menu(self) -> None:
@@ -183,6 +229,14 @@ class BeeWindow(QWidget):
         self.focus_switch_action.setCheckable(True)
         self.focus_switch_action.setChecked(self._focus_switch)
         self.focus_switch_action.toggled.connect(self._set_focus_switch)
+        self.icon_prank_action = self.menu.addAction("🖱 Таскать ярлыки от скуки")
+        self.icon_prank_action.setCheckable(True)
+        self.icon_prank_action.setChecked(self._icon_prank)
+        self.icon_prank_action.toggled.connect(self._set_icon_prank)
+        self.icon_restore_action = self.menu.addAction("↩️ Вернуть ярлыки на место")
+        self.icon_restore_action.setEnabled(False)  # включит контроллер, когда есть что вернуть
+        self.icon_restore_action.triggered.connect(self.icon_restore_requested.emit)
+        self.menu.setToolTipsVisible(True)
         self.menu.addSeparator()
         self.exit_action = self.menu.addAction("❌ Выход")
         self.exit_action.triggered.connect(QApplication.quit)
@@ -235,10 +289,17 @@ class BeeWindow(QWidget):
 
     # --- позиция -----------------------------------------------------------
 
+    def feet_offset(self) -> int:
+        """y нижнего края лапок в окне: окно ставится так, чтобы он пришёлся на кромку."""
+        return feet_y(self.height())
+
     def _move_to_initial_position(self) -> None:
-        area = QGuiApplication.primaryScreen().availableGeometry()
-        self.move(area.right() - WINDOW_SIZE - SCREEN_MARGIN + 1,
-                  area.bottom() - WINDOW_SIZE - SCREEN_MARGIN + 1)
+        """Справа внизу основного экрана, лапками на верхнем краю панели задач."""
+        screen = QGuiApplication.primaryScreen()
+        area, geom = screen.availableGeometry(), screen.geometry()
+        y = area.bottom() + 1 - feet_y(WINDOW_SIZE)
+        y = max(geom.top(), min(y, geom.bottom() - WINDOW_SIZE + 1))
+        self.move(area.right() - WINDOW_SIZE - SCREEN_MARGIN + 1, y)
 
     def _clamp_to_desktop(self, pos: QPoint) -> QPoint:
         """Держит окно внутри виртуального рабочего стола."""
@@ -261,9 +322,12 @@ class BeeWindow(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
+        walking = self.is_walking
+        perched = self._perched and not self._dragging and not self.is_flying
         state = PaintState(phase=self._phase, mood=self.engine.mood,
                            angry_high=self.engine.angry_high, dragging=self._dragging,
-                           tilt=self._tilt, wiggle=self._wiggle, stinging=self.stinging)
+                           tilt=self._tilt, wiggle=self._wiggle, stinging=self.stinging,
+                           perched=perched, walking=walking, facing=self._facing)
         paint_bee(p, QRectF(0, 0, self.width(), self.height()), state)
         p.end()
 
@@ -288,6 +352,8 @@ class BeeWindow(QWidget):
             if math.hypot(delta.x(), delta.y()) < DRAG_THRESHOLD:
                 return
             self.cancel_flight()
+            self.stop_walking()
+            self.perched = False  # пчелу подняли в воздух
             self._dragging = True
             self.drag_started.emit()
         self.move(self._clamp_to_desktop(self._press_pos + delta.toPoint()))
@@ -327,9 +393,13 @@ class BeeWindow(QWidget):
         easing — кривая движения. Полёт длится не дольше 3 с. Возвращает длительность в мс.
         """
         self.cancel_flight()
+        self.stop_walking()
+        self.perched = False  # полёт — значит, в воздухе
         start = self.pos()
         dx, dy = target.x() - start.x(), target.y() - start.y()
         dist = math.hypot(dx, dy)
+        if dx:
+            self._facing = 1 if dx > 0 else -1  # летит головой вперёд
         speed = FLIGHT_SPEED if speed is None else speed
         duration = int(max(min_ms, min(3000, dist / speed * 1000)))
         self._tilt = 20.0 * dx / dist if dist > 1 else 0.0
@@ -376,3 +446,82 @@ class BeeWindow(QWidget):
         self.update()
         if callback is not None:
             callback()
+
+    # --- ходьба ------------------------------------------------------------
+
+    @property
+    def perched(self) -> bool:
+        """Сидит ли пчела на кромке (окна или панели задач): рисуется стоящей на лапках.
+
+        Ставит контроллер посадки; полёт и перетаскивание сбрасывают сами.
+        """
+        return self._perched
+
+    @perched.setter
+    def perched(self, value: bool) -> None:
+        if value != self._perched:
+            self._perched = value
+            self.update()
+
+    @property
+    def facing(self) -> int:
+        """Куда смотрит голова: -1 влево, +1 вправо."""
+        return self._facing
+
+    @property
+    def is_walking(self) -> bool:
+        """Идёт ли пчела пешком прямо сейчас."""
+        return self._walk_target is not None
+
+    def walk_to(self, x: int, on_arrived: Callable[[], None] | None = None,
+                speed: float = WALK_SPEED) -> bool:
+        """Идёт пешком по горизонтали, пока левый край окна не окажется в x; y не меняется.
+
+        Скорость — speed px/с (по часам self._clock, так что шаги не зависят от дрожания
+        таймера). По приходе зовёт on_arrived. Во время перетаскивания отказывается (False).
+        """
+        if self._dragging:
+            return False
+        self.stop_walking()
+        x = int(x)
+        if x != self.x():
+            self._facing = 1 if x > self.x() else -1
+        self._walk_target = x
+        self._walk_speed = max(1.0, float(speed))
+        self._walk_last = self._clock()
+        self._walk_x = float(self.x())
+        self._on_walked = on_arrived
+        self._walk_timer.start()
+        self.update()
+        return True
+
+    def stop_walking(self) -> None:
+        """Останавливается на месте без вызова on_arrived."""
+        self._walk_timer.stop()
+        was = self._walk_target is not None
+        self._walk_target = None
+        self._on_walked = None
+        if was:
+            self.update()
+
+    def _on_walk_tick(self) -> None:
+        target = self._walk_target
+        if target is None:
+            self._walk_timer.stop()
+            return
+        now = self._clock()
+        step = self._walk_speed * max(0.0, now - self._walk_last)
+        self._walk_last = now
+        if round(self._walk_x) != self.x():
+            self._walk_x = float(self.x())  # окно сдвинули со стороны (пчела следует за окном)
+        left = target - self._walk_x
+        if abs(left) <= step:
+            self.move(target, self.y())
+            callback = self._on_walked
+            self.stop_walking()
+            if callback is not None:
+                callback()
+            return
+        self._walk_x += math.copysign(step, left)
+        if round(self._walk_x) != self.x():
+            self.move(round(self._walk_x), self.y())

@@ -17,6 +17,20 @@ DARK = QColor("#3B2A1A")
 WING = QColor(255, 255, 255, 150)
 WING_EDGE = QColor(140, 170, 200, 200)
 
+# Геометрия рисунка (в единицах BASE): от неё зависит, где у пчелы лапки.
+BODY_DROP = 8.0    # рисунок опущен на столько ниже центра окна
+LEG_TOP = 24.0     # откуда растут лапки (от центра тела)
+LEG_LEN = 9.0      # длина лапки
+LEG_PEN = 2.4      # толщина лапки (скруглённый конец добавляет половину)
+# Нижний край лапок в позе «сидит/идёт» (y от верха окна размером BASE).
+FEET_Y = BASE / 2 + BODY_DROP + LEG_TOP + LEG_LEN + LEG_PEN / 2
+
+STEP_HZ = 2.5          # шагов в секунду каждой парой лапок при ходьбе
+STEP_SWING = 24.0      # размах шага, градусы
+STEP_BOB = 1.5         # подпрыгивание тела на каждом шаге, px
+TWITCH_PERIOD_S = 4.0  # сидящая пчела изредка вздрагивает крыльями
+TWITCH_S = 0.3
+
 
 @dataclass
 class PaintState:
@@ -28,6 +42,19 @@ class PaintState:
     tilt: float = 0.0           # наклон, градусы (по часовой)
     wiggle: tuple[float, float] = (0.0, 0.0)  # смещение рисунка внутри окна, px
     stinging: bool = False      # выпад жалом (кусает окно)
+    perched: bool = False       # сидит на кромке: крылья сложены, лапки стоят, без покачивания
+    walking: bool = False       # идёт по кромке: лапки шагают, крылья сложены
+    facing: int = -1            # куда смотрит голова: -1 влево (как нарисовано), +1 вправо
+
+
+def feet_y(height: float) -> int:
+    """y нижнего края лапок в окне высотой height (поза «сидит»): им пчела стоит на кромке."""
+    return round(FEET_Y * height / BASE)
+
+
+def _standing(st: PaintState) -> bool:
+    """Стоит ли пчела на лапках (сидит или идёт), а не летает."""
+    return (st.perched or st.walking) and not st.dragging
 
 
 def _star(cx: float, cy: float, r: float) -> QPolygonF:
@@ -48,6 +75,9 @@ def _heart(cx: float, cy: float, s: float) -> QPainterPath:
 
 
 def _draw_wings(p: QPainter, st: PaintState) -> None:
+    if _standing(st):
+        _draw_folded_wings(p, st)
+        return
     fast = st.dragging or st.angry_high
     speed = 2 * math.pi * (13.0 if fast else 7.0)
     amp = 38.0 if fast else 24.0
@@ -62,14 +92,38 @@ def _draw_wings(p: QPainter, st: PaintState) -> None:
         p.restore()
 
 
-def _draw_legs(p: QPainter, st: PaintState) -> None:
-    p.setPen(QPen(DARK, 2.4, Qt.SolidLine, Qt.RoundCap))
-    for i, x in enumerate((-2, 10, 22)):
-        kick = math.sin(st.phase * 2 * math.pi * 6 + i * 2.1) * 25 if st.dragging else 0.0
+def _draw_folded_wings(p: QPainter, st: PaintState) -> None:
+    """Крылья сложены вдоль спины к жалу; сидящая пчела изредка ими вздрагивает."""
+    twitch = 0.0
+    if st.perched and not st.walking:
+        t = st.phase % TWITCH_PERIOD_S
+        if t < TWITCH_S:
+            twitch = math.sin(t / TWITCH_S * 2 * math.pi * 2) * 10
+    p.setPen(QPen(WING_EDGE, 1.2))
+    p.setBrush(WING)
+    for side, base_angle in ((0, 62.0), (1, 76.0)):
         p.save()
-        p.translate(x, 24)
+        p.translate(8 + side * 8, -10)
+        p.rotate(base_angle - twitch * (1 if side == 0 else 0.6))
+        p.drawEllipse(QRectF(-6, -30, 16, 32))
+        p.restore()
+
+
+def _draw_legs(p: QPainter, st: PaintState) -> None:
+    p.setPen(QPen(DARK, LEG_PEN, Qt.SolidLine, Qt.RoundCap))
+    walking = st.walking and not st.dragging
+    for i, x in enumerate((-2, 10, 22)):
+        if st.dragging:
+            kick = math.sin(st.phase * 2 * math.pi * 6 + i * 2.1) * 25
+        elif walking:
+            # соседние лапки шагают в противофазе
+            kick = math.sin(st.phase * 2 * math.pi * STEP_HZ + (i % 2) * math.pi) * STEP_SWING
+        else:
+            kick = 0.0
+        p.save()
+        p.translate(x, LEG_TOP)
         p.rotate(kick)
-        p.drawLine(QPointF(0, 0), QPointF(0, 9))
+        p.drawLine(QPointF(0, 0), QPointF(0, LEG_LEN))
         p.restore()
 
 
@@ -210,6 +264,8 @@ def _draw_extras(p: QPainter, st: PaintState) -> None:
         p.setPen(QColor("#6C4AB6"))
         p.save()
         p.translate(-26, -34)
+        if st.facing > 0:
+            p.scale(-1, 1)  # рисунок отзеркален, а «?» должен читаться
         p.rotate(math.sin(t * 3) * 10)
         p.drawText(QRectF(-14, -16, 28, 32), Qt.AlignCenter, "?")
         p.restore()
@@ -223,10 +279,17 @@ def paint_bee(p: QPainter, rect: QRectF, state: PaintState) -> None:
     scale = rect.width() / BASE
     p.translate(rect.center())
     p.scale(scale, scale)
-    # лёгкое покачивание вверх-вниз и смещения (барахтанье, дрожь)
-    bob = math.sin(state.phase * 2 * math.pi * 0.8) * 2.5
-    p.translate(state.wiggle[0], bob + state.wiggle[1] + 8)
+    # лёгкое покачивание вверх-вниз (в полёте) и смещения (барахтанье, дрожь)
+    if state.walking and not state.dragging:
+        bob = -abs(math.sin(state.phase * 2 * math.pi * STEP_HZ)) * STEP_BOB
+    elif _standing(state):
+        bob = 0.0
+    else:
+        bob = math.sin(state.phase * 2 * math.pi * 0.8) * 2.5
+    p.translate(state.wiggle[0], bob + state.wiggle[1] + BODY_DROP)
     p.rotate(state.tilt)
+    if state.facing > 0:
+        p.scale(-1, 1)  # голова справа: зеркалим весь рисунок
     if state.stinging:
         p.translate(12, 0)  # короткий выпад вперёд жалом
         p.rotate(8)

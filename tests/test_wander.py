@@ -12,14 +12,18 @@ from PySide6.QtWidgets import QApplication
 
 from bee_pet import wander
 from bee_pet.mood import Action, Mood, MoodEngine
-from bee_pet.wander import (FLIGHT_PROMPT, WANDER_TAG, WanderController, fallback_corner,
-                            landing_corner, landing_skip_reason, pick_landing, spot_covered)
+from bee_pet.painter import feet_y
+from bee_pet.wander import (FLIGHT_PROMPT, WANDER_TAG, WanderController, landing_corner,
+                            landing_skip_reason, logical_to_physical, pick_landing,
+                            spot_covered, taskbar_corner, taskbar_y)
 from bee_pet.winapi import WindowInfo
 
 OWN = 4242
 SCREENS = [(0, 0, 1920, 1080)]
 QT_SCREENS = [(QRect(0, 0, 1920, 1080), 1.0)]
 AREA = QRect(0, 0, 1920, 1040)
+SCREEN = QRect(0, 0, 1920, 1080)
+FEET = feet_y(120)
 
 
 def win(**kw) -> WindowInfo:
@@ -95,19 +99,42 @@ def test_pick_landing_prefers_other_window():
 
 def test_landing_corner_sits_on_edge_and_clamps():
     pos = landing_corner((400, 300), QT_SCREENS, [AREA], 120)
-    assert pos == QPoint(400 - 60, 300 - 120 + wander.LAND_OFFSET)
+    assert pos == QPoint(400 - 60, 300 - FEET)
     # развёрнутое окно: кромка у верха экрана — пчела не вылезает за экран
     assert landing_corner((10, 1), QT_SCREENS, [AREA], 120) == QPoint(0, 0)
     scaled = [(QRect(0, 0, 1280, 720), 1.5)]
     assert landing_corner((600, 300), scaled, [QRect(0, 0, 1280, 700)], 120) == \
-        QPoint(400 - 60, 200 - 120 + wander.LAND_OFFSET)
+        QPoint(400 - 60, 200 - FEET)
 
 
-def test_fallback_corner_near_bottom():
+def test_feet_offset_matches_old_landing():
+    # лапки на 102-й строке окна 120×120 (раньше было LAND_OFFSET = 18 снизу)
+    assert FEET == 102
+
+
+def test_taskbar_corner_feet_on_taskbar_edge():
     for s in range(20):
-        pos = fallback_corner(AREA, 120, random.Random(s))
+        pos = taskbar_corner(AREA, SCREEN, 120, random.Random(s))
         assert 0 <= pos.x() <= 1920 - 120
-        assert 1040 - 120 - wander.BOTTOM_JITTER <= pos.y() <= 1040 - 120
+        assert pos.y() + FEET == 1040  # первая строка панели задач
+    assert taskbar_corner(AREA, SCREEN, 120, random.Random(1), x=5000).x() == 1800
+    # панели снизу нет (скрыта): пчела стоит у низа экрана, окно не вылезает за экран
+    assert taskbar_y(SCREEN, SCREEN, 120) == 1080 - 120
+
+
+def test_logical_to_physical_roundtrip():
+    scaled = [(QRect(0, 0, 1280, 720), 1.5), (QRect(1280, 0, 1920, 1080), 1.0)]
+    assert logical_to_physical(QPoint(400, 200), scaled) == (600, 300)
+    assert logical_to_physical(QPoint(1300, 10), scaled) == (1300, 10)
+
+
+def test_pick_landing_nearest():
+    ws = [win(hwnd=1, rect=(0, 0, 500, 400)), win(hwnd=2, rect=(600, 700, 1200, 900))]
+    for s in range(10):
+        target, spot = pick_landing(ws, OWN, random.Random(s), SCREENS, near=(900, 650))
+        assert target.hwnd == 2 and spot == (900, 701)
+        target, spot = pick_landing(ws, OWN, random.Random(s), SCREENS, near=(10, 10))
+        assert target.hwnd == 1 and spot == (75, 1)  # у края кромки нельзя (отступ 15 %)
 
 
 # --- контроллер --------------------------------------------------------------
@@ -124,6 +151,7 @@ class FakeBee(QObject):
 
     def __init__(self):
         super().__init__()
+        self.pos_ = QPoint(500, 500)
         self.engine = MoodEngine()
         self.is_dragging = False
         self.focus_switch_enabled = True
@@ -138,6 +166,15 @@ class FakeBee(QObject):
 
     def width(self):
         return 120
+
+    def x(self):
+        return self.pos_.x()
+
+    def y(self):
+        return self.pos_.y()
+
+    def geometry(self):
+        return QRect(self.pos_, self.pos_ + QPoint(119, 119))
 
     def say(self, text, duration_ms=4000):
         self.said.append((text, duration_ms))
@@ -207,7 +244,7 @@ def make(qapp, windows=None, available=True, **kw):
     client = FakeClient()
     params = dict(winapi_module=api, own_pid=OWN, rng=random.Random(1), idle_focus_s=120,
                   screens_provider=lambda: QT_SCREENS, areas_provider=lambda: [AREA],
-                  autostart=False)
+                  screen_provider=lambda point: (AREA, SCREEN), autostart=False)
     params.update(kw)
     ctl = WanderController(bee, client, **params)
     return bee, api, client, ctl
@@ -217,22 +254,60 @@ def test_wander_flies_to_window_edge(qapp):
     bee, api, client, ctl = make(qapp, [win(hwnd=7, rect=(100, 300, 700, 700))])
     assert ctl.wander_now()
     assert ctl.flying and ctl.target.hwnd == 7 and not ctl.focus_planned
+    landed = []
+    ctl.landed.connect(landed.append)
     pos = bee.flights[0]
-    assert pos.y() == 301 - 120 + wander.LAND_OFFSET
+    assert pos.y() == 301 - FEET
     assert 100 <= pos.x() + 60 < 700
     bee.land()
     assert not ctl.flying and ctl.current_hwnd == 7
+    assert [w.hwnd for w in landed] == [7] and ctl.current_window.hwnd == 7
     assert api.focused == [] and api.closed == []
 
 
-def test_fallback_when_no_windows_or_no_winapi(qapp):
-    for available, windows in ((True, []), (False, [win(hwnd=7)])):
+def test_fallback_to_taskbar_when_no_windows_or_no_winapi(qapp):
+    hidden = [win(hwnd=7, minimized=True), win(hwnd=8, cloaked=True)]
+    for available, windows in ((True, []), (True, hidden), (False, [win(hwnd=7)])):
         bee, api, client, ctl = make(qapp, windows, available)
+        landed = []
+        ctl.landed.connect(landed.append)
         assert ctl.wander_now()
         assert ctl.target is None
-        assert bee.flights[0].y() >= 1040 - 120 - wander.BOTTOM_JITTER
+        assert bee.flights[0].y() + FEET == AREA.bottom() + 1  # лапки на панели задач
+        assert 0 <= bee.flights[0].x() <= 1920 - 120
         bee.land()
         assert ctl.current_hwnd is None and api.focused == []
+        assert landed == [None]
+
+
+def test_land_nearest_window_or_taskbar(qapp):
+    windows = [win(hwnd=1, rect=(0, 0, 500, 400)), win(hwnd=2, rect=(600, 700, 1200, 900))]
+    bee, api, client, ctl = make(qapp, windows)
+    bee.pos_ = QPoint(840, 500)  # центр (899, 559), лапки на 602 — ближе всего окно 2
+    landed = []
+    ctl.landed.connect(landed.append)
+    assert ctl.land_nearest()
+    assert bee.flights[0] == QPoint(899 - 60, 701 - FEET)
+    assert client.requests == []  # короткий перелёт без жужжания
+    bee.land()
+    assert landed[0].hwnd == 2 and api.focused == []
+    # окон нет — на панель задач прямо под пчелой
+    api.windows = []
+    assert ctl.land_nearest()
+    assert bee.flights[1] == QPoint(840, AREA.bottom() + 1 - FEET)
+    bee.land()
+    assert landed[1] is None
+    # злая, в руках или в полёте — не садится
+    bee.act(Action.SWAT)
+    assert not ctl.land_nearest()
+
+
+def test_take_off_hop_never_focuses(qapp):
+    bee, api, client, ctl = focus_env(qapp)
+    ctl.wander_now(allow_focus=False)
+    assert not ctl.focus_planned
+    bee.land()
+    assert api.focused == []
 
 
 def test_no_wander_when_angry_dragging_or_flying(qapp):
@@ -391,3 +466,16 @@ def test_flight_buzz_suppressed_when_angry(qapp):
     bee.act(Action.SWAT)
     client.answer("buzzz")
     assert bee.said == [] and bee.engine.mood is Mood.ANGRY
+
+
+def test_no_landing_on_window_at_screen_top():
+    """Развёрнутое окно (кромка у верхнего края экрана): стоять негде — не садимся."""
+    maximized = win(hwnd=1, rect=(0, 0, 1920, 1040))
+    normal = win(hwnd=2, rect=(300, 400, 900, 800))
+    assert landing_skip_reason(maximized, OWN, SCREENS, headroom=128) is not None
+    assert landing_skip_reason(maximized, OWN, SCREENS) is None  # без запаса — как раньше
+    assert landing_skip_reason(normal, OWN, SCREENS, headroom=128) is None
+    picks = {pick_landing([normal, maximized], OWN, random.Random(s), SCREENS,
+                          headroom=128)[0].hwnd for s in range(10)}
+    assert picks == {2}
+    assert pick_landing([maximized], OWN, random.Random(1), SCREENS, headroom=128) is None

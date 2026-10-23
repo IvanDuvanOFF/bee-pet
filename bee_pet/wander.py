@@ -4,6 +4,10 @@
 в тестах подменяют заглушкой. Над чужими окнами здесь возможно лишь одно действие —
 `winapi.focus_window` (вывести окно на передний план), и только когда пользователь
 давно не трогал клавиатуру и мышь. Окна здесь никогда не закрываются.
+
+Если садиться не на что (окон нет, все свёрнуты или закрыты, нет WinAPI), пчела
+садится на верхний край панели задач своего экрана. Где именно пчела села, узнаёт
+WalkController (сигнал `landed`) — дальше она ходит по кромке пешком.
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ import random
 from types import ModuleType
 from typing import Callable, Sequence
 
-from PySide6.QtCore import QObject, QPoint, QRect, QTimer
+from PySide6.QtCore import QObject, QPoint, QRect, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 
 from bee_pet import winapi
@@ -21,6 +25,7 @@ from bee_pet.biting import (BLOCKED_CLASSES, MAX_MOVE_PX, MIN_HEIGHT, MIN_WIDTH,
                             _intersects, _moved, physical_screen_rects, physical_to_logical,
                             qt_screens)
 from bee_pet.mood import Mood, MoodChange
+from bee_pet.painter import feet_y
 from bee_pet.winapi import WindowInfo
 
 log = logging.getLogger("bee_pet.wander")
@@ -36,18 +41,29 @@ WANDER_TAG = "wander"
 
 LANDING_TRIES = 6      # сколько случайных точек на верхней кромке окна пробовать
 LANDING_INSET = 0.15   # не садиться у самых краёв окна (доля ширины)
-LAND_OFFSET = 18       # нижнее поле рисунка пчелы в окне: так лапки стоят на кромке
-BOTTOM_JITTER = 40     # запасная точка: насколько выше нижнего края экрана можно сесть
 
 Spot = tuple[int, int]
+# Провайдер экрана: точка (логические координаты) -> (availableGeometry, geometry) экрана.
+ScreenProvider = Callable[[QPoint], tuple[QRect, QRect]]
 
 
 # --- политика -------------------------------------------------------------
 
 
+def headroom_px(screens: Sequence[tuple[QRect, float]], feet: int) -> int:
+    """Сколько физических пикселей над кромкой нужно пчеле, чтобы стоять на ней целиком."""
+    return max((round(feet * dpr) for _, dpr in screens), default=feet)
+
+
 def landing_skip_reason(win: WindowInfo, own_pid: int,
-                        screens: Sequence[Rect] | None = None) -> str | None:
-    """Почему на окно нельзя садиться; None, если можно. Терминалы и IDE разрешены."""
+                        screens: Sequence[Rect] | None = None,
+                        headroom: int = 0) -> str | None:
+    """Почему на окно нельзя садиться; None, если можно. Терминалы и IDE разрешены.
+
+    headroom — сколько места (физ. px) нужно над кромкой внутри экрана: у развёрнутого
+    окна кромка у самого края экрана, стоять на ней негде, и пчела выбирает другое
+    окно или панель задач.
+    """
     if win.pid == own_pid:
         return "окно собственного процесса"
     if win.class_name in BLOCKED_CLASSES:
@@ -65,6 +81,9 @@ def landing_skip_reason(win: WindowInfo, own_pid: int,
         return "окно слишком маленькое"
     if screens is not None and not any(_intersects(win.rect, s) for s in screens):
         return "окно вне экранов"
+    if screens and headroom > 0 and not any(
+            s[0] < right and left < s[2] and s[1] + headroom <= top < s[3] for s in screens):
+        return "над кромкой нет места (окно у верхнего края экрана)"
     return None
 
 
@@ -88,11 +107,19 @@ def _on_screen(spot: Spot, screens: Sequence[Rect] | None) -> bool:
 
 
 def landing_spot(win: WindowInfo, higher: Sequence[WindowInfo], rng: random.Random,
-                 screens: Sequence[Rect] | None = None) -> Spot | None:
-    """Случайная открытая точка на верхней кромке окна (физические пиксели) или None."""
+                 screens: Sequence[Rect] | None = None,
+                 near_x: int | None = None) -> Spot | None:
+    """Случайная открытая точка на верхней кромке окна (физические пиксели) или None.
+
+    near_x — сначала пробуется точка кромки, ближайшая к этому x (посадка «поближе»).
+    """
     left, top, right, _ = win.rect
     inset = int((right - left) * LANDING_INSET)
     lo, hi = left + inset, right - 1 - inset
+    if near_x is not None:
+        spot = (max(lo, min(near_x, hi)), top + 1)
+        if _on_screen(spot, screens) and not spot_covered(spot, higher):
+            return spot
     for _ in range(LANDING_TRIES):
         spot = (rng.randint(lo, hi), top + 1)
         if _on_screen(spot, screens) and not spot_covered(spot, higher):
@@ -103,20 +130,23 @@ def landing_spot(win: WindowInfo, higher: Sequence[WindowInfo], rng: random.Rand
 def pick_landing(windows: Sequence[WindowInfo], own_pid: int, rng: random.Random | None = None,
                  screens: Sequence[Rect] | None = None, current_hwnd: int | None = None,
                  exclude: Callable[[WindowInfo], str | None] | None = None,
+                 near: Spot | None = None, headroom: int = 0,
                  ) -> tuple[WindowInfo, Spot] | None:
     """Случайное окно для посадки и точка на его кромке; окна идут сверху вниз.
 
     exclude — дополнительный фильтр (причина отказа или None). Окно, на котором пчела
-    уже сидит, выбирается, только если других нет.
+    уже сидит, выбирается, только если других нет. near — точка (физические пиксели):
+    тогда берётся не случайное окно, а точка посадки, ближайшая к ней.
     """
     rng = rng or random.Random()
     options: list[tuple[WindowInfo, Spot]] = []
     for i, win in enumerate(windows):
-        reason = landing_skip_reason(win, own_pid, screens)
+        reason = landing_skip_reason(win, own_pid, screens, headroom)
         if reason is None and exclude is not None:
             reason = exclude(win)
         if reason is None:
-            spot = landing_spot(win, _occluders(windows, i, own_pid), rng, screens)
+            spot = landing_spot(win, _occluders(windows, i, own_pid), rng, screens,
+                                near[0] if near is not None else None)
             if spot is None:
                 reason = "кромка закрыта другими окнами"
             else:
@@ -125,6 +155,8 @@ def pick_landing(windows: Sequence[WindowInfo], own_pid: int, rng: random.Random
             log.debug("не сажусь на %r (%s): %s", win.title, win.process_name, reason)
     if not options:
         return None
+    if near is not None:
+        return min(options, key=lambda o: (o[1][0] - near[0]) ** 2 + (o[1][1] - near[1]) ** 2)
     fresh = [o for o in options if o[0].hwnd != current_hwnd]
     return rng.choice(fresh or options)
 
@@ -139,6 +171,21 @@ def available_areas() -> list[QRect]:
     return [s.availableGeometry() for s in ([primary] if primary else []) + others]
 
 
+def screen_at(point: QPoint) -> tuple[QRect, QRect]:
+    """(availableGeometry, geometry) экрана, где точка; если она вне экранов — основного."""
+    screen = QGuiApplication.screenAt(point) or QGuiApplication.primaryScreen()
+    return screen.availableGeometry(), screen.geometry()
+
+
+def logical_to_physical(point: QPoint, screens: Sequence[tuple[QRect, float]]) -> Spot:
+    """Обратное к physical_to_logical (то же допущение о расположении экранов)."""
+    if not screens:
+        return point.x(), point.y()
+    geom, dpr = next(((g, d) for g, d in screens if g.contains(point)), screens[0])
+    return (round(geom.left() * dpr + (point.x() - geom.left()) * dpr),
+            round(geom.top() * dpr + (point.y() - geom.top()) * dpr))
+
+
 def _clamp(pos: QPoint, area: QRect, size: int) -> QPoint:
     x = max(area.left(), min(pos.x(), area.right() - size + 1))
     y = max(area.top(), min(pos.y(), area.bottom() - size + 1))
@@ -149,25 +196,42 @@ def landing_corner(spot: Spot, screens: Sequence[tuple[QRect, float]],
                    areas: Sequence[QRect], size: int) -> QPoint:
     """Левый верхний угол окна пчелы, чтобы она сидела на кромке в точке spot."""
     point = physical_to_logical(spot, screens)
-    pos = QPoint(point.x() - size // 2, point.y() - size + LAND_OFFSET)
+    pos = QPoint(point.x() - size // 2, point.y() - feet_y(size))
     if not areas:
         return pos
     area = next((a for a in areas if a.contains(point)), areas[0])
     return _clamp(pos, area, size)
 
 
-def fallback_corner(area: QRect, size: int, rng: random.Random) -> QPoint:
-    """Случайная точка у нижнего края рабочей области (окон для посадки нет)."""
-    x = rng.randint(area.left(), max(area.left(), area.right() - size + 1))
-    y = area.bottom() - size + 1 - rng.randint(0, BOTTOM_JITTER)
-    return _clamp(QPoint(x, y), area, size)
+def taskbar_y(area: QRect, geom: QRect, size: int) -> int:
+    """y левого верхнего угла окна пчелы, стоящей лапками на верхнем краю панели задач.
+
+    Край панели — первая строка под рабочей областью (area.bottom() + 1). Если панели
+    снизу нет (скрыта или сбоку), area совпадает с экраном и пчела стоит у его низа.
+    """
+    y = area.bottom() + 1 - feet_y(size)
+    return max(geom.top(), min(y, geom.bottom() - size + 1))
+
+
+def taskbar_corner(area: QRect, geom: QRect, size: int, rng: random.Random,
+                   x: int | None = None) -> QPoint:
+    """Точка посадки на панель задач: x случайный (или заданный), лапки на её кромке."""
+    lo, hi = area.left(), max(area.left(), area.right() - size + 1)
+    x = rng.randint(lo, hi) if x is None else max(lo, min(x, hi))
+    return QPoint(x, taskbar_y(area, geom, size))
 
 
 # --- контроллер -----------------------------------------------------------
 
 
 class WanderController(QObject):
-    """Время от времени перелетает на верхнюю кромку случайного окна и жужжит в полёте."""
+    """Время от времени перелетает на верхнюю кромку случайного окна и жужжит в полёте.
+
+    Сигнал landed(WindowInfo | None) — пчела долетела и села: на окно или (None)
+    на панель задач.
+    """
+
+    landed = Signal(object)
 
     def __init__(self, bee, client=None, *, winapi_module: ModuleType = winapi,
                  own_pid: int | None = None, rng: random.Random | None = None,
@@ -175,6 +239,7 @@ class WanderController(QObject):
                  idle_focus_s: float = IDLE_FOCUS_S,
                  screens_provider: Callable[[], list[tuple[QRect, float]]] = qt_screens,
                  areas_provider: Callable[[], list[QRect]] = available_areas,
+                 screen_provider: ScreenProvider = screen_at,
                  autostart: bool = True) -> None:
         super().__init__(bee)
         self._bee = bee
@@ -186,11 +251,13 @@ class WanderController(QObject):
         self._idle_focus_s = idle_focus_s
         self._screens_provider = screens_provider
         self._areas_provider = areas_provider
+        self._screen_provider = screen_provider
 
         self.flying = False                      # летит ли пчела именно по нашей команде
         self.target: WindowInfo | None = None    # окно, к которому летим
         self.focus_planned = False               # переключить ли на него фокус по прилёту
         self.current_hwnd: int | None = None     # окно, на котором пчела сидит сейчас
+        self.current_window: WindowInfo | None = None  # его снимок на момент посадки
         self._buzz_seq = 0
 
         self._timer = QTimer(self)
@@ -234,6 +301,7 @@ class WanderController(QObject):
 
     def on_drag_started(self) -> None:
         self.current_hwnd = None
+        self.current_window = None
         if self.flying:
             self._abort("пчелу взяли в руки", cancel=True)
 
@@ -256,20 +324,69 @@ class WanderController(QObject):
         return (self._winapi.AVAILABLE and self._focus_switch_enabled()
                 and self._winapi.idle_seconds() >= self._idle_focus_s)
 
-    def wander_now(self) -> bool:
-        """Пробует улететь прямо сейчас; True, если полёт начат."""
-        refuse = None
+    def _refusal(self) -> str | None:
         if self._bee.engine.mood is Mood.ANGRY:
-            refuse = "пчела злится"
-        elif self._bee.is_dragging:
-            refuse = "пчелу тащат"
-        elif self._bee.is_flying:
-            refuse = "пчела уже летит"
+            return "пчела злится"
+        if self._bee.is_dragging:
+            return "пчелу тащат"
+        if self._bee.is_flying:
+            return "пчела уже летит"
+        occupied = getattr(self._bee, "occupied_by", None)
+        if occupied:
+            return f"пчела занята ({occupied})"
+        return None
+
+    def _taskbar_corner(self, x: int | None = None) -> QPoint:
+        """Посадка на панель задач экрана, где сейчас пчела."""
+        area, geom = self._screen_provider(self._bee.geometry().center())
+        return taskbar_corner(area, geom, self._bee.width(), self._rng, x)
+
+    def land_nearest(self) -> bool:
+        """Садится на ближайшую кромку окна, а если таких нет — на панель задач под собой.
+
+        Нужна после того, как пчелу отпустили или она успокоилась. Окна не переключает
+        и в полёте не жужжит (перелёт короткий). True, если полёт начат.
+        """
+        refuse = self._refusal()
+        if refuse:
+            log.debug("не сажусь: %s", refuse)
+            return False
+        screens = self._screens_provider()
+        size = self._bee.width()
+        center = self._bee.geometry().center()
+        feet = QPoint(center.x(), self._bee.y() + feet_y(size))
+        windows = self._winapi.list_windows() if self._winapi.AVAILABLE else []
+        picked = pick_landing(windows, self._own_pid, self._rng,
+                              physical_screen_rects(screens),
+                              near=logical_to_physical(feet, screens),
+                              headroom=headroom_px(screens, feet_y(size)))
+        if picked is not None:
+            target, spot = picked
+            corner = landing_corner(spot, screens, self._areas_provider(), size)
+            log.info("сажусь на ближайшее окно %r (%s, hwnd=%s)", target.title,
+                     target.process_name, target.hwnd)
+        else:
+            target = None
+            corner = self._taskbar_corner(self._bee.x())
+            log.info("окон для посадки нет: сажусь на панель задач")
+        self.target = target
+        self.focus_planned = False
+        self.flying = True
+        self._bee.fly_to(corner, self._on_arrived)
+        return True
+
+    def wander_now(self, allow_focus: bool = True) -> bool:
+        """Пробует улететь прямо сейчас; True, если полёт начат.
+
+        allow_focus=False — не переключать окно даже в простое (пчела просто перелетает,
+        например, потому что окно под ней исчезло).
+        """
+        refuse = self._refusal()
         if refuse:
             log.debug("не гуляю: %s", refuse)
             return False
 
-        focus = self._user_idle()
+        focus = allow_focus and self._user_idle()
         screens = self._screens_provider()
         areas = self._areas_provider()
         size = self._bee.width()
@@ -286,7 +403,8 @@ class WanderController(QObject):
 
         windows = self._winapi.list_windows() if self._winapi.AVAILABLE else []
         picked = pick_landing(windows, self._own_pid, self._rng,
-                              physical_screen_rects(screens), self.current_hwnd, exclude)
+                              physical_screen_rects(screens), self.current_hwnd, exclude,
+                              headroom=headroom_px(screens, feet_y(size)))
         if picked is not None:
             target, spot = picked
             corner = landing_corner(spot, screens, areas, size)
@@ -295,10 +413,9 @@ class WanderController(QObject):
                      target.hwnd, ", потом переключу на него" if focus else "")
         else:
             target = None
-            area = areas[0] if areas else QRect(0, 0, 800, 600)
-            corner = fallback_corner(area, size, self._rng)
+            corner = self._taskbar_corner()
             self.focus_planned = False
-            log.info("подходящих окон нет: лечу к низу экрана")
+            log.info("подходящих окон нет: лечу на панель задач")
 
         self.target = target
         self.flying = True
@@ -314,8 +431,10 @@ class WanderController(QObject):
         self.target = None
         self.focus_planned = False
         self.current_hwnd = target.hwnd if target is not None else None
+        self.current_window = target
         if target is not None and focus:
             self._maybe_focus(target)
+        self.landed.emit(target)
 
     def _focus_refusal(self, target: WindowInfo) -> str | None:
         """Причина не переключать окно (последняя проверка прямо перед действием)."""

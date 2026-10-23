@@ -10,9 +10,11 @@ from bee_pet.chat import ChatWindow
 from bee_pet.chatter import ChatterController
 from bee_pet.frenzy import FrenzyController
 from bee_pet.hold import HOLD_TAG, HoldController
+from bee_pet.icon_prank import IconPrankController
 from bee_pet.llm import BeeClient
 from bee_pet.mood import ACTION_PHRASES, Mood
 from bee_pet.mood_sync import MoodRequest, MoodSync
+from bee_pet.walk import WalkController
 from bee_pet.wander import WanderController
 
 MENU_TAG = "menu"
@@ -63,8 +65,11 @@ def main() -> None:
     bite = BiteController(bee)  # на не-Windows неактивна (winapi.AVAILABLE = False)
     HoldController(bee, sync)  # долго держат мышкой — злится
     FrenzyController(bee, bite)  # злая пчела мечется, пока укус не ведёт её к окну
-    WanderController(bee, client)  # дочерний объект пчелы; без WinAPI летает к низу экрана
-    ChatterController(bee, client, bite)  # жужжит сама по себе; настроение не меняет
+    # Дочерние объекты пчелы (живут, пока живёт она); ссылки нужны для связки.
+    wander = WanderController(bee, client)  # перелёты по окнам; без окон — на панель задач
+    chatter = ChatterController(bee, client, bite)  # жужжит сама по себе; настроение не меняет
+    WalkController(bee, wander, chatter, bite)  # спокойная ходит пешком по кромке
+    IconPrankController(bee, wander, bite)  # от скуки таскает ярлыки (выключено по умолчанию)
     bee.chat_requested.connect(chat.open_chat)
     app.aboutToQuit.connect(client.shutdown)
     bee.show()

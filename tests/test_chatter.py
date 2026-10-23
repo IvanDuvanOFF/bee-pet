@@ -250,3 +250,21 @@ def test_mood_never_changes_from_ping_reply(env):
     assert bee.engine.mood is Mood.NEUTRAL and not bee.engine.angry_high
     assert changes == []  # mood_changed не испускался — укусу не с чего начаться
     assert bite.state == bite.IDLE
+
+
+def test_ping_now_uses_same_skip_rules(env):
+    bee, client, bite, make = env
+    ctl = make(calm_interval_s=(100, 100))
+    remaining = ctl._timer.remainingTime()
+    assert ctl.ping_now()
+    assert client.requests[-1][0] == PING_PROMPT and ctl.pending
+    assert ctl._timer.remainingTime() <= remaining  # расписание не тронуто
+    assert not ctl.ping_now()  # прошлый пинг ещё ждёт ответа
+    client.answer("zz")
+    bite.state = "warning"
+    assert not ctl.ping_now()
+    bite.state = bite.IDLE
+    bee.say("🐝 ответ меню", 10_000)
+    assert not ctl.ping_now()
+    bee.bubble.hide()
+    assert ctl.ping_now() and len(client.requests) == 2
