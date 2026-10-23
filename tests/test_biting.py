@@ -368,6 +368,12 @@ def test_only_winapi_close_posts_messages():
             code = re.sub(r'""".*?"""|#.*', "", text, flags=re.S)
             assert not re.search(r"TerminateProcess|DestroyWindow|taskkill|WM_QUIT|SendMessage",
                                  code, re.I)
+        elif path.name == "server.py":
+            # Запускает и останавливает только собственный дочерний llama-server
+            # (subprocess.Popen, его terminate/kill); остальное запрещено и здесь.
+            code = re.sub(r'""".*?"""|#.*', "", text, flags=re.S)
+            assert not re.search(r"PostMessage|SendMessage|TerminateProcess|DestroyWindow|"
+                                 r"taskkill|WM_QUIT|os\.kill", code, re.I)
         else:
             code = re.sub(r'""".*?"""|#.*', "", text, flags=re.S)
             assert not forbidden.search(code), path.name

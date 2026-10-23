@@ -1,6 +1,7 @@
 """Настройка QApplication и сборка компонентов."""
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 
 from PySide6.QtWidgets import QApplication
 
@@ -14,6 +15,7 @@ from bee_pet.icon_prank import IconPrankController
 from bee_pet.llm import BeeClient
 from bee_pet.mood import ACTION_PHRASES, Mood
 from bee_pet.mood_sync import MoodRequest, MoodSync
+from bee_pet.server import log_dir, setup_server
 from bee_pet.walk import WalkController
 from bee_pet.wander import WanderController
 
@@ -50,14 +52,42 @@ def wire_history_reset(bee: BeeWindow, client: BeeClient) -> None:
         lambda change: client.clear_history() if change.new is Mood.NEUTRAL else None)
 
 
+LOG_FORMAT = "%(asctime)s %(name)s: %(message)s"
+
+
+def setup_logging() -> None:
+    """Лог в консоль; без консоли (pythonw, собранный exe) — в %LOCALAPPDATA%\\bee-pet\\bee-pet.log.
+
+    Решения пчелы (укус, отказы, метания, выбор сервера модели) видны в консоли
+    при запуске `python -m bee_pet`.
+    """
+    if sys.stderr is not None:
+        handler: logging.Handler = logging.StreamHandler()
+    else:
+        handler = RotatingFileHandler(log_dir() / "bee-pet.log", maxBytes=1_000_000,
+                                      backupCount=1, encoding="utf-8")
+
+        def log_crash(exc_type, exc, tb) -> None:
+            # Без консоли падения иначе пропадут бесследно.
+            logging.getLogger("bee_pet").critical("необработанная ошибка",
+                                                  exc_info=(exc_type, exc, tb))
+
+        sys.excepthook = log_crash
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, handlers=[handler])
+
+
 def main() -> None:
-    """Запускает приложение: окно пчелы, клиент модели и чат."""
-    # Решения пчелы (укус, отказы, метания) видны в консоли при запуске `python -m bee_pet`.
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
+    """Запускает приложение: сервер модели, окно пчелы, клиент модели и чат."""
+    setup_logging()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    # До клиента: BEE_URL / уже запущенный сервер / встроенный llama-server в фоне.
+    server = setup_server()
     bee = BeeWindow()
     client = BeeClient()
+    if server is not None:
+        server.ready.connect(client.mark_online)  # модель загрузилась — без офлайн-паузы
+        app.aboutToQuit.connect(server.stop)
     sync = MoodSync(bee, client)  # настроение по ответам модели
     chat = ChatWindow(bee, client, sync)
     wire_menu_replies(bee, client, sync)

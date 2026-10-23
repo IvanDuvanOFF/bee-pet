@@ -12,6 +12,11 @@
   Шлёт реплику в llama-server (`BEE_URL`, по умолчанию `http://127.0.0.1:8081`).
 - `docs/bee_instructions.md` — фрагмент CLAUDE.md, который объясняет агентам, как общаться с пчелой.
 - `bee_pet/` — код питомца (пакет, запуск `python -m bee_pet`).
+- `bee_pet/server.py` — выбор сервера модели при запуске: `BEE_URL` → уже отвечающий 8081 →
+  встроенный llama-server из `vendor/` (или из exe) на свободном порту; останавливается
+  при выходе, Job Object убивает его и при падении пчелы.
+- `tools/fetch_vendor.py` — качает в `vendor/` (не в git) llama-server и GGUF с пиннингом
+  версий и SHA256; `tools/launch.py` + `bee-pet.spec` — сборка exe PyInstaller'ом (README).
 - `tests/` — pytest-тесты.
 - `docs/spec/` — поэтапное ТЗ на английском для субагентов (`00-common.md` + `stage-N.md`).
 
@@ -185,6 +190,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest                    # GUI-тесты: QT_QPA_PLATFORM=offscreen
 llama-server -hf schizophyllume/BeeLLM -c 4096 --port 8081   # необязательно, для чата
 ```
+
+Сборка exe (подробно в README): `pip install -r requirements-build.txt`,
+`python tools/fetch_vendor.py`, `pyinstaller bee-pet.spec` → `dist/bee-pet.exe`.
 
 ## Соглашения
 

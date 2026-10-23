@@ -14,6 +14,8 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
 
 from bee_pet.mood import parse_mood_tag
 
+# Адрес llama-server; ask_bee читает его при каждом запросе, так что при запуске
+# его можно поменять (server.py направляет пчелу на встроенный сервер).
 BEE_URL = os.environ.get("BEE_URL", "http://127.0.0.1:8081")
 
 MAX_REPLY_CHARS = 200
@@ -37,6 +39,12 @@ FALLBACK_BUZZ = [
     "*пчела жужжит что-то своё* 🐝",
     "бзз-бзз-бзз 🌸",
 ]
+
+
+def set_base_url(url: str) -> None:
+    """Меняет адрес llama-server для следующих запросов."""
+    global BEE_URL
+    BEE_URL = url.rstrip("/")
 
 
 def ask_bee(messages: Messages, max_tokens: int = 64, timeout: float = 10.0) -> str:
@@ -198,6 +206,12 @@ class BeeClient(QObject):
         if parsed is not None:
             self.mood_ready.emit(tag, *parsed)
         self.reply_ready.emit(tag, text, from_model)
+
+    @Slot()
+    def mark_online(self) -> None:
+        """Сервер точно ожил (ответил /health): отменяет офлайн-паузу после сбоев."""
+        self.online = True
+        self._offline_until = 0.0
 
     def clear_history(self) -> None:
         """Забывает диалог: пчела успокоилась и не помнит прошлых обид."""
