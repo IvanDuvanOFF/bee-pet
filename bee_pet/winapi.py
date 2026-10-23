@@ -1,7 +1,11 @@
 """Работа с чужими окнами через WinAPI (ctypes). Только Windows; на других ОС — заглушки.
 
-Единственное действие над чужим окном — вежливое `PostMessageW(WM_CLOSE)` в `close_window`.
-Никаких TerminateProcess, DestroyWindow, taskkill и WM_QUIT здесь нет и быть не должно.
+Действий над чужими окнами ровно два:
+- вежливое `PostMessageW(WM_CLOSE)` в `close_window` (злая пчела кусает окно);
+- вывод окна на передний план в `focus_window` (пчела переключает окна, пока
+  пользователя нет за компьютером).
+Никаких TerminateProcess, DestroyWindow, taskkill, WM_QUIT и эмуляции нажатий
+клавиш (keybd_event, SendInput) здесь нет и быть не должно.
 """
 from __future__ import annotations
 
@@ -45,6 +49,9 @@ if AVAILABLE:
 
     class _TokenElevation(ctypes.Structure):
         _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+    class _LastInputInfo(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
 
     _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -93,6 +100,24 @@ if AVAILABLE:
             self.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
                                           wintypes.WPARAM, wintypes.LPARAM]
             self.PostMessageW.restype = wintypes.BOOL
+            self.GetLastInputInfo = u32.GetLastInputInfo
+            self.GetLastInputInfo.argtypes = [ctypes.POINTER(_LastInputInfo)]
+            self.GetLastInputInfo.restype = wintypes.BOOL
+            self.GetForegroundWindow = u32.GetForegroundWindow
+            self.GetForegroundWindow.argtypes = []
+            self.GetForegroundWindow.restype = wintypes.HWND
+            self.SetForegroundWindow = u32.SetForegroundWindow
+            self.SetForegroundWindow.argtypes = [wintypes.HWND]
+            self.SetForegroundWindow.restype = wintypes.BOOL
+            self.BringWindowToTop = u32.BringWindowToTop
+            self.BringWindowToTop.argtypes = [wintypes.HWND]
+            self.BringWindowToTop.restype = wintypes.BOOL
+            self.AttachThreadInput = u32.AttachThreadInput
+            self.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+            self.AttachThreadInput.restype = wintypes.BOOL
+            self.IsWindow = u32.IsWindow
+            self.IsWindow.argtypes = [wintypes.HWND]
+            self.IsWindow.restype = wintypes.BOOL
 
             self.OpenProcess = k32.OpenProcess
             self.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -104,6 +129,12 @@ if AVAILABLE:
             self.CloseHandle = k32.CloseHandle
             self.CloseHandle.argtypes = [wintypes.HANDLE]
             self.CloseHandle.restype = wintypes.BOOL
+            self.GetTickCount = k32.GetTickCount
+            self.GetTickCount.argtypes = []
+            self.GetTickCount.restype = wintypes.DWORD
+            self.GetCurrentThreadId = k32.GetCurrentThreadId
+            self.GetCurrentThreadId.argtypes = []
+            self.GetCurrentThreadId.restype = wintypes.DWORD
 
             self.OpenProcessToken = a32.OpenProcessToken
             self.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
@@ -235,8 +266,48 @@ if AVAILABLE:
         return result
 
     def close_window(hwnd: int) -> bool:
-        """Вежливо просит окно закрыться (WM_CLOSE). Единственное действие над чужим окном."""
+        """Вежливо просит окно закрыться (WM_CLOSE). Никаких убийств процессов."""
         return bool(_api.PostMessageW(hwnd, WM_CLOSE, 0, 0))
+
+    def idle_seconds() -> float:
+        """Сколько секунд не было ввода с клавиатуры и мыши во всей системе."""
+        info = _LastInputInfo()
+        info.cbSize = ctypes.sizeof(info)
+        if not _api.GetLastInputInfo(ctypes.byref(info)):
+            return 0.0
+        # Оба счётчика 32-битные и переполняются раз в ~49 дней: считаем по модулю 2**32.
+        elapsed_ms = (int(_api.GetTickCount()) - int(info.dwTime)) & 0xFFFFFFFF
+        return elapsed_ms / 1000.0
+
+    def foreground_window() -> int:
+        """hwnd активного окна (0, если его нет)."""
+        return int(_api.GetForegroundWindow() or 0)
+
+    def focus_window(hwnd: int) -> bool:
+        """Выводит окно на передний план. Второе и последнее действие над чужим окном.
+
+        Фоновому процессу SetForegroundWindow обычно запрещён, поэтому на время вызова
+        поток пчелы подключается к очереди ввода потока текущего активного окна
+        (AttachThreadInput) и обязательно отключается в finally. Нажатия клавиш не эмулируются.
+        Свёрнутые окна не трогаем (не разворачиваем).
+        """
+        if not hwnd or not _api.IsWindow(hwnd) or _api.IsIconic(hwnd):
+            return False
+        ours = int(_api.GetCurrentThreadId())
+        foreground = _api.GetForegroundWindow()
+        theirs = int(_api.GetWindowThreadProcessId(foreground, None)) if foreground else 0
+        attached = False
+        try:
+            if theirs and theirs != ours:
+                attached = bool(_api.AttachThreadInput(ours, theirs, True))
+            _api.SetForegroundWindow(hwnd)
+            _api.BringWindowToTop(hwnd)
+            # Код возврата SetForegroundWindow ненадёжен (для UWP-окон бывает FALSE при
+            # успехе), поэтому проверяем, какое окно стало активным на самом деле.
+            return int(_api.GetForegroundWindow() or 0) == int(hwnd)
+        finally:
+            if attached:
+                _api.AttachThreadInput(ours, theirs, False)
 
 else:
     def list_windows() -> list[WindowInfo]:
@@ -244,5 +315,17 @@ else:
         return []
 
     def close_window(hwnd: int) -> bool:  # noqa: ARG001
+        """Вне Windows ничего не делает."""
+        return False
+
+    def idle_seconds() -> float:
+        """Вне Windows простой не отслеживается."""
+        return 0.0
+
+    def foreground_window() -> int:
+        """Вне Windows активного окна нет."""
+        return 0
+
+    def focus_window(hwnd: int) -> bool:  # noqa: ARG001
         """Вне Windows ничего не делает."""
         return False

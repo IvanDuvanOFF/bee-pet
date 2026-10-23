@@ -7,6 +7,7 @@ import random
 import re
 import time
 import urllib.request
+from collections import deque
 from typing import Callable
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
@@ -15,6 +16,13 @@ BEE_URL = os.environ.get("BEE_URL", "http://127.0.0.1:8081")
 
 MAX_REPLY_CHARS = 200
 OFFLINE_BACKOFF = 30.0  # секунд без сетевых попыток после сбоя
+HISTORY_TURNS = 4  # сколько последних пар «реплика — ответ» помнит пчела
+
+# Сообщение для chat-эндпоинта: {"role": "user" | "assistant", "content": str}.
+Messages = list[dict[str, str]]
+
+# Ведущий тег настроения в ответе модели: «[happy:low] ...» или «[angry] ...».
+_MOOD_TAG_RE = re.compile(r"^\s*\[\s*\w+(?:\s*:\s*\w+)?\s*\]\s*")
 
 # Заготовки на случай, если пчела улетела (сервер не запущен).
 FALLBACK_BUZZ = [
@@ -29,21 +37,30 @@ FALLBACK_BUZZ = [
 ]
 
 
-def ask_bee(prompt: str, max_tokens: int = 64, timeout: float = 10.0) -> str:
-    """Шлёт реплику в llama-server (/v1/completions); при сбоях бросает исключение."""
+def ask_bee(messages: Messages, max_tokens: int = 64, timeout: float = 10.0) -> str:
+    """Шлёт диалог в llama-server (/v1/chat/completions); при сбоях бросает исключение.
+
+    Chat-эндпоинт сам накладывает шаблон BeeLLM (<|user|>…<|bee|>…</s>): на сыром
+    /v1/completions модель без шаблона отвечает мусором или пустой строкой.
+    """
     body = json.dumps({
-        "prompt": prompt,
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 1.0,
     }).encode("utf-8")
     req = urllib.request.Request(
-        f"{BEE_URL}/v1/completions",
+        f"{BEE_URL}/v1/chat/completions",
         data=body,
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.load(resp)
-    return data["choices"][0]["text"].strip()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def strip_mood_tag(text: str) -> str:
+    """Убирает ведущий тег настроения вида «[happy:low]» или «[angry]» и пробелы вокруг."""
+    return _MOOD_TAG_RE.sub("", text or "", count=1).strip()
 
 
 def random_fallback() -> str:
@@ -67,37 +84,45 @@ def clean_reply(text: str) -> str:
 
 class _WorkerSignals(QObject):
     """Сигналы воркера (QRunnable сам не QObject)."""
-    done = Signal(object, str, bool)  # tag, text, from_model
+    # tag, text, from_model, prompt, raw (сырой ответ модели; пустой при сбое), remember
+    done = Signal(object, str, bool, str, str, bool)
 
 
 class _AskRunnable(QRunnable):
     """Выполняет запрос к модели в пуле потоков."""
 
-    def __init__(self, ask: Callable[[str], str], prompt: str, tag: object,
-                 signals: _WorkerSignals) -> None:
+    def __init__(self, ask: Callable[[Messages], str], messages: Messages, prompt: str,
+                 tag: object, signals: _WorkerSignals, remember: bool = True) -> None:
         super().__init__()
-        self._ask, self._prompt, self._tag, self._signals = ask, prompt, tag, signals
+        self._ask, self._messages, self._prompt = ask, messages, prompt
+        self._tag, self._signals, self._remember = tag, signals, remember
 
     def run(self) -> None:
         try:
-            text = self._ask(self._prompt)
-            if not text.strip():
+            raw = self._ask(self._messages)
+            text = strip_mood_tag(raw)
+            if not text:
                 raise ValueError("пустой ответ")
-            result = (clean_reply(text), True)
+            result = (clean_reply(text), True, self._prompt, raw.strip())
         except Exception:  # любой сбой сети или формата -> заготовка
-            result = (random_fallback(), False)
+            result = (random_fallback(), False, self._prompt, "")
         try:
-            self._signals.done.emit(self._tag, *result)
+            self._signals.done.emit(self._tag, *result, self._remember)
         except RuntimeError:
             pass  # объект сигналов уже удалён при выходе из приложения
 
 
 class BeeClient(QObject):
-    """Асинхронный клиент: запрос в воркере, ответ сигналом в GUI-потоке."""
+    """Асинхронный клиент: запрос в воркере, ответ сигналом в GUI-потоке.
+
+    Хранит короткую общую историю диалога (меню и чат вместе), чтобы пчела помнила,
+    что её только что шлёпнули, и «sorry» имело смысл. История трогается только
+    в GUI-потоке: список сообщений собирается в request(), пополняется в _on_done().
+    """
 
     reply_ready = Signal(object, str, bool)  # tag, text, from_model
 
-    def __init__(self, ask: Callable[[str], str] = ask_bee,
+    def __init__(self, ask: Callable[[Messages], str] = ask_bee,
                  clock: Callable[[], float] = time.monotonic,
                  backoff: float = OFFLINE_BACKOFF, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -106,22 +131,46 @@ class BeeClient(QObject):
         self._backoff = backoff
         self._offline_until = 0.0
         self.online: bool | None = None
+        # Пары (реплика пользователя, ответ модели). Ответ храним сырым, с тегом
+        # настроения: так история ближе к формату, на котором обучалась BeeLLM.
+        self._history: deque[tuple[str, str]] = deque(maxlen=HISTORY_TURNS)
         self._pool = QThreadPool(self)
         self._signals = _WorkerSignals(self)
         self._signals.done.connect(self._on_done)
 
-    def request(self, prompt: str, tag: object = None) -> None:
-        """Запрашивает ответ; при недавнем сбое сразу отвечает заготовкой."""
+    def _build_messages(self, prompt: str) -> Messages:
+        """Свежий список сообщений: история + новая реплика (воркер получает копию)."""
+        messages: Messages = []
+        for user, bee in self._history:
+            messages.append({"role": "user", "content": user})
+            messages.append({"role": "assistant", "content": bee})
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    def request(self, prompt: str, tag: object = None, remember: bool = True) -> None:
+        """Запрашивает ответ; при недавнем сбое сразу отвечает заготовкой.
+
+        remember=False — разовая реплика: модель получает только её (без истории),
+        и ответ в историю не попадает (например, жужжание в полёте).
+        """
         if self.online is False and self._clock() < self._offline_until:
             text = random_fallback()
             QTimer.singleShot(0, lambda: self.reply_ready.emit(tag, text, False))
             return
-        self._pool.start(_AskRunnable(self._ask, prompt, tag, self._signals))
+        if remember:
+            messages = self._build_messages(prompt)
+        else:
+            messages = [{"role": "user", "content": prompt}]
+        self._pool.start(_AskRunnable(self._ask, messages, prompt, tag, self._signals, remember))
 
-    @Slot(object, str, bool)
-    def _on_done(self, tag: object, text: str, from_model: bool) -> None:
+    @Slot(object, str, bool, str, str, bool)
+    def _on_done(self, tag: object, text: str, from_model: bool,
+                 prompt: str, raw: str, remember: bool = True) -> None:
         self.online = from_model
-        if not from_model:
+        if from_model and remember:
+            self._history.append((prompt, raw))
+        else:
+            # Заготовки в историю не попадают: модель их не говорила.
             self._offline_until = self._clock() + self._backoff
         self.reply_ready.emit(tag, text, from_model)
 

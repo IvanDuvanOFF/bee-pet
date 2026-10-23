@@ -111,3 +111,141 @@ def test_bubble_show_and_hide(qapp):
     assert b.text == "новый текст"
     QTest.qWait(300)
     assert not b.isVisible()
+
+
+@pytest.mark.parametrize("text", ["бзз", "🐝 bzz bz zz bzz",
+                                  "🐝 *STINGS YOU* *screams in bee* *knocks over the flower* BZZT!!"])
+def test_bubble_text_fits(qapp, text):
+    """Текст, нарисованный в области пузыря, помещается в неё без обрезки."""
+    from bee_pet.bubble import BORDER, PAD, TAIL_H, TEXT_FLAGS
+    b = SpeechBubble()
+    b.show_text(text, QRect(500, 500, 80, 80), duration_ms=100)
+    inner = QRectF(0, 0, b.width() - 2 * (PAD + BORDER),
+                   b.height() - TAIL_H - 2 * (PAD + BORDER))
+    img = QImage(1, 1, QImage.Format_ARGB32_Premultiplied)
+    p = QPainter(img)
+    p.setFont(b._font)
+    needed = p.boundingRect(inner, TEXT_FLAGS, text)
+    p.end()
+    assert needed.width() <= inner.width() + 0.5
+    assert needed.height() <= inner.height() + 0.5
+    b.hide()
+
+
+# --- мельтешение курсором и переключатель фокуса ------------------------------
+
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QMouseEvent
+
+from bee_pet.bee_window import JITTER_COOLDOWN_S, JitterDetector
+
+
+def _feed(det, points, dt):
+    """Скармливает детектору точки с шагом dt; возвращает список результатов."""
+    return [det.add(i * dt, x, y) for i, (x, y) in enumerate(points)]
+
+
+def _zigzag(n, amp=60.0, axis=0):
+    """Курсор мечется туда-сюда по одной оси с размахом amp."""
+    pts = []
+    for i in range(n):
+        v = 500.0 + (amp if i % 2 else 0.0)
+        pts.append((v, 300.0) if axis == 0 else (300.0, v))
+    return pts
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_jitter_fast_back_and_forth(axis):
+    assert any(_feed(JitterDetector(), _zigzag(10, axis=axis), 0.05))
+
+
+def test_jitter_slow_movement_ignored():
+    # те же развороты, но по одному в секунду — окно успевает забыть
+    assert not any(_feed(JitterDetector(), _zigzag(10), 0.6))
+
+
+def test_jitter_one_direction_ignored():
+    pts = [(100.0 + 20 * i, 300.0) for i in range(40)]
+    assert not any(_feed(JitterDetector(), pts, 0.02))
+
+
+def test_jitter_small_noise_ignored():
+    # дрожание на 2 px: много разворотов, но шаги короче порога и путь мал
+    assert not any(_feed(JitterDetector(), _zigzag(40, amp=2.0), 0.02))
+
+
+def test_jitter_samples_expire():
+    # три разворота, затем ещё три точки: подряд это мельтешение...
+    first, second = _zigzag(5), _zigzag(4)[1:]
+    det = JitterDetector()
+    assert any(_feed(det, first + second, 0.05))
+    # ...а с паузой дольше окна старые точки забыты
+    det = JitterDetector()
+    assert not any(_feed(det, first, 0.05))
+    assert not any(det.add(5.0 + i * 0.05, x, y) for i, (x, y) in enumerate(second))
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+def _hover(w, gx, gy):
+    local = QPointF(gx - w.x(), gy - w.y())
+    ev = QMouseEvent(QMouseEvent.MouseMove, local, QPointF(gx, gy),
+                     Qt.NoButton, Qt.NoButton, Qt.NoModifier)
+    w.mouseMoveEvent(ev)
+
+
+def _rub(w, clock, n=10):
+    for x, y in _zigzag(n, amp=60.0):
+        clock.t += 0.03
+        _hover(w, w.x() + x - 470, w.y() + 60)
+
+
+def test_jitter_over_bee_is_swat(qapp, settings):
+    clock = _Clock()
+    w = BeeWindow(settings=settings, clock=clock)
+    w.show()
+    assert w.hasMouseTracking()
+    performed = []
+    w.action_performed.connect(performed.append)
+    _rub(w, clock)
+    assert performed == [Action.SWAT]
+    assert w.engine.mood is Mood.ANGRY
+    assert w.bubble.text == "БЗЗ!! 😠"
+    # пауза: продолжение мельтешения сразу не даёт второго шлепка
+    _rub(w, clock)
+    assert performed == [Action.SWAT]
+    # после паузы — снова шлепок
+    clock.t += JITTER_COOLDOWN_S
+    _rub(w, clock)
+    assert performed == [Action.SWAT, Action.SWAT]
+    w.bubble.hide()
+    w.close()
+
+
+def test_jitter_ignored_while_pressed(qapp, settings):
+    clock = _Clock()
+    w = BeeWindow(settings=settings, clock=clock)
+    performed = []
+    w.action_performed.connect(performed.append)
+    w._press_global = QPointF(0, 0)  # левая кнопка зажата
+    _rub(w, clock)
+    assert performed == []
+
+
+def test_focus_switch_default_and_persist(qapp, settings):
+    w = BeeWindow(settings=settings)
+    assert w.focus_switch_enabled is True
+    assert w.focus_switch_action.isChecked()
+    acts = w.menu.actions()
+    assert acts.index(w.focus_switch_action) == acts.index(w.biting_action) + 1
+    got = []
+    w.focus_switch_toggled.connect(got.append)
+    w.focus_switch_action.setChecked(False)
+    assert got == [False] and not w.focus_switch_enabled
+    assert BeeWindow(settings=settings).focus_switch_enabled is False

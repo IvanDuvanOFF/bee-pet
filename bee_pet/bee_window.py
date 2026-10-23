@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import math
 import random
+import time
+from collections import deque
 from typing import Callable
 
 from PySide6.QtCore import (QEasingCurve, QPoint, QPropertyAnimation, QRect, QRectF,
@@ -21,6 +23,13 @@ FRAME_MS = 33
 DRAG_THRESHOLD = 4
 FLIGHT_SPEED = 400.0  # px/с
 
+# «Мельтешение» курсором над пчелой считается шлепком.
+JITTER_WINDOW_S = 1.0      # скользящее окно наблюдения, с
+JITTER_MIN_REVERSALS = 4   # сколько смен направления по одной оси нужно
+JITTER_MIN_PATH = 250.0    # суммарный путь курсора за окно, px
+JITTER_MIN_STEP = 3.0      # шаги по оси короче этого не меняют направление (шум)
+JITTER_COOLDOWN_S = 3.0    # пауза после срабатывания: одно мельтешение = один шлепок
+
 # Пункты меню действий: (подпись, действие).
 MENU_ACTIONS: list[tuple[str, Action]] = [
     ("🌸 Дать цветок", Action.FLOWER),
@@ -31,6 +40,52 @@ MENU_ACTIONS: list[tuple[str, Action]] = [
 ]
 
 
+class JitterDetector:
+    """Распознаёт мельтешение курсора: частые развороты по одной оси на большом пути.
+
+    Точки старше окна наблюдения выбрасываются, поэтому курсор может ненадолго
+    выйти за пределы пчелы и вернуться — мельтешение всё равно засчитается.
+    """
+
+    def __init__(self, window_s: float = JITTER_WINDOW_S,
+                 min_reversals: int = JITTER_MIN_REVERSALS,
+                 min_path: float = JITTER_MIN_PATH,
+                 min_step: float = JITTER_MIN_STEP) -> None:
+        self.window_s = window_s
+        self.min_reversals = min_reversals
+        self.min_path = min_path
+        self.min_step = min_step
+        self._samples: deque[tuple[float, float, float]] = deque()
+
+    def clear(self) -> None:
+        """Забывает все накопленные точки."""
+        self._samples.clear()
+
+    def add(self, t: float, x: float, y: float) -> bool:
+        """Добавляет точку курсора; True, если в окне наблюдения есть мельтешение."""
+        self._samples.append((t, x, y))
+        while self._samples and t - self._samples[0][0] > self.window_s:
+            self._samples.popleft()
+        if len(self._samples) < 3:
+            return False
+        path = 0.0
+        reversals = [0, 0]
+        last_sign = [0, 0]
+        prev = self._samples[0]
+        for cur in list(self._samples)[1:]:
+            deltas = (cur[1] - prev[1], cur[2] - prev[2])
+            path += math.hypot(*deltas)
+            for axis, d in enumerate(deltas):
+                if abs(d) < self.min_step:
+                    continue
+                sign = 1 if d > 0 else -1
+                if last_sign[axis] and sign != last_sign[axis]:
+                    reversals[axis] += 1
+                last_sign[axis] = sign
+            prev = cur
+        return path >= self.min_path and max(reversals) >= self.min_reversals
+
+
 class BeeWindow(QWidget):
     """Прозрачное безрамочное окно с пчелой."""
 
@@ -38,17 +93,21 @@ class BeeWindow(QWidget):
     action_performed = Signal(object)   # Action из меню
     chat_requested = Signal()
     biting_toggled = Signal(bool)
+    focus_switch_toggled = Signal(bool)
     drag_started = Signal()
 
     def __init__(self, settings: QSettings | None = None,
-                 engine: MoodEngine | None = None) -> None:
+                 engine: MoodEngine | None = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setFixedSize(WINDOW_SIZE, WINDOW_SIZE)
+        self.setMouseTracking(True)  # движения без кнопок — для распознавания мельтешения
 
         self._settings = settings if settings is not None else QSettings("bee-pet", "bee-pet")
         self._biting = self._settings.value("biting_enabled", True, type=bool)
+        self._focus_switch = self._settings.value("focus_switch_enabled", True, type=bool)
         self.engine = engine if engine is not None else MoodEngine()
         self.bubble = SpeechBubble()
 
@@ -61,6 +120,9 @@ class BeeWindow(QWidget):
         self._press_pos = QPoint()
         self._flight: QPropertyAnimation | None = None
         self._on_arrived: Callable[[], None] | None = None
+        self._clock = clock
+        self._jitter = JitterDetector()
+        self._jitter_cooldown_until = -math.inf
 
         self._move_to_initial_position()
 
@@ -86,6 +148,17 @@ class BeeWindow(QWidget):
         self._settings.sync()
         self.biting_toggled.emit(value)
 
+    @property
+    def focus_switch_enabled(self) -> bool:
+        """Разрешено ли переключать окна, пока пчела отлучилась."""
+        return self._focus_switch
+
+    def _set_focus_switch(self, value: bool) -> None:
+        self._focus_switch = value
+        self._settings.setValue("focus_switch_enabled", value)
+        self._settings.sync()
+        self.focus_switch_toggled.emit(value)
+
     # --- меню --------------------------------------------------------------
 
     def _build_menu(self) -> None:
@@ -102,6 +175,10 @@ class BeeWindow(QWidget):
         self.biting_action.setCheckable(True)
         self.biting_action.setChecked(self._biting)
         self.biting_action.toggled.connect(self._set_biting)
+        self.focus_switch_action = self.menu.addAction("🪟 Переключать окна, пока меня нет")
+        self.focus_switch_action.setCheckable(True)
+        self.focus_switch_action.setChecked(self._focus_switch)
+        self.focus_switch_action.toggled.connect(self._set_focus_switch)
         self.menu.addSeparator()
         self.exit_action = self.menu.addAction("❌ Выход")
         self.exit_action.triggered.connect(QApplication.quit)
@@ -187,7 +264,12 @@ class BeeWindow(QWidget):
             self._dragging = False
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if self._press_global is None or not (event.buttons() & Qt.LeftButton):
+        if not (event.buttons() & Qt.LeftButton):
+            if not event.buttons():
+                pos = event.globalPosition()
+                self._on_hover_move(pos.x(), pos.y())
+            return
+        if self._press_global is None:
             return
         delta = event.globalPosition() - self._press_global
         if not self._dragging:
@@ -204,6 +286,20 @@ class BeeWindow(QWidget):
             self._dragging = False
             self._wiggle = (0.0, 0.0)
             self.update()
+
+    # --- мельтешение курсором ----------------------------------------------
+
+    def _on_hover_move(self, x: float, y: float) -> None:
+        """Копит точки курсора без нажатых кнопок; мельтешение = шлепок."""
+        if self._dragging or self._press_global is not None or self.menu.isVisible():
+            return
+        now = self._clock()
+        if now < self._jitter_cooldown_until:
+            return
+        if self._jitter.add(now, x, y):
+            self._jitter.clear()
+            self._jitter_cooldown_until = now + JITTER_COOLDOWN_S
+            self._on_menu_action(Action.SWAT)
 
     # --- полёт -------------------------------------------------------------
 

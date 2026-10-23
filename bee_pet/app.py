@@ -8,6 +8,7 @@ from bee_pet.biting import BiteController
 from bee_pet.chat import ChatWindow
 from bee_pet.llm import BeeClient
 from bee_pet.mood import ACTION_PHRASES, Action
+from bee_pet.wander import WanderController
 
 MENU_TAG = "menu"
 
@@ -34,6 +35,7 @@ def main() -> None:
     chat = ChatWindow(bee, client)
     wire_menu_replies(bee, client)
     BiteController(bee)  # на не-Windows неактивна (winapi.AVAILABLE = False)
+    WanderController(bee, client)  # дочерний объект пчелы; без WinAPI летает к низу экрана
     bee.chat_requested.connect(chat.open_chat)
     app.aboutToQuit.connect(client.shutdown)
     bee.show()

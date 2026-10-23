@@ -1,15 +1,19 @@
 """Речевой пузырь: отдельное безрамочное окно, не забирающее фокус."""
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import QRect, QRectF, Qt, QTimer
-from PySide6.QtGui import (QColor, QFont, QFontMetrics, QGuiApplication, QPainter,
-                           QPainterPath, QPen)
+from PySide6.QtGui import (QColor, QFont, QGuiApplication, QImage, QPainter, QPainterPath,
+                           QPen)
 from PySide6.QtWidgets import QWidget
 
 MAX_TEXT_WIDTH = 240
 PAD = 10
 TAIL_H = 10
 TAIL_W = 14
+BORDER = 1  # отступ контура от края окна, чтобы обводку не срезало
+TEXT_FLAGS = int(Qt.TextWordWrap | Qt.AlignCenter)
 
 
 class SpeechBubble(QWidget):
@@ -54,11 +58,9 @@ class SpeechBubble(QWidget):
 
     def _layout(self) -> None:
         """Считает размер по тексту и ставит окно над (или под) якорем в пределах экрана."""
-        fm = QFontMetrics(self._font)
-        text_rect = fm.boundingRect(QRect(0, 0, MAX_TEXT_WIDTH, 10000),
-                                    int(Qt.TextWordWrap), self._text)
-        w = text_rect.width() + 2 * PAD
-        h = text_rect.height() + 2 * PAD + TAIL_H
+        text_w, text_h = self._measure()
+        w = text_w + 2 * (PAD + BORDER)
+        h = text_h + 2 * (PAD + BORDER) + TAIL_H
         screen = QGuiApplication.screenAt(self._anchor.center()) or QGuiApplication.primaryScreen()
         area = screen.availableGeometry()
         x = self._anchor.center().x() - w // 2
@@ -71,12 +73,25 @@ class SpeechBubble(QWidget):
         self._tail_x = max(PAD + TAIL_W, min(self._anchor.center().x() - x, w - PAD - TAIL_W))
         self.setGeometry(x, y, w, h)
 
+    def _measure(self) -> tuple[int, int]:
+        """Размер текста так, как его нарисует QPainter.
+
+        QFontMetrics не учитывает подмену шрифта для эмодзи (🐝 рисуется шрифтом
+        Segoe UI Emoji и шире), и короткая строка при рисовании переносилась и обрезалась.
+        """
+        img = QImage(1, 1, QImage.Format_ARGB32_Premultiplied)
+        p = QPainter(img)
+        p.setFont(self._font)
+        rect = p.boundingRect(QRectF(0, 0, MAX_TEXT_WIDTH, 10000), TEXT_FLAGS, self._text)
+        p.end()
+        return math.ceil(rect.width()), math.ceil(rect.height())
+
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
         top = TAIL_H if self._below else 0
-        body = QRectF(1, top + 1, w - 2, h - TAIL_H - 2)
+        body = QRectF(BORDER, top + BORDER, w - 2 * BORDER, h - TAIL_H - 2 * BORDER)
         path = QPainterPath()
         path.addRoundedRect(body, 12, 12)
         tail = QPainterPath()
@@ -95,6 +110,6 @@ class SpeechBubble(QWidget):
         p.drawPath(path)
         p.setPen(QColor("#3B2A1A"))
         p.setFont(self._font)
-        p.drawText(body.adjusted(PAD, PAD - 1, -PAD, -PAD + 1),
-                   int(Qt.TextWordWrap | Qt.AlignCenter), self._text)
+        # Область текста ровно того размера, что посчитал _measure().
+        p.drawText(body.adjusted(PAD, PAD, -PAD, -PAD), TEXT_FLAGS, self._text)
         p.end()
