@@ -354,6 +354,7 @@ def test_inert_on_linux_by_default(qapp):
     if winapi.AVAILABLE:
         pytest.skip("только не-Windows")
     assert winapi.list_windows() == [] and winapi.close_window(1) is False
+    assert winapi.minimize_window(1) is False
 
 
 def test_only_winapi_close_posts_messages():
@@ -364,10 +365,12 @@ def test_only_winapi_close_posts_messages():
     for path in root.glob("*.py"):
         text = path.read_text(encoding="utf-8")
         if path.name == "winapi.py":
-            assert len(re.findall(r"PostMessageW\(hwnd", text)) == 1
+            # Ровно два сообщения чужим окнам: WM_CLOSE (укус) и SC_MINIMIZE (шалость с ярлыками).
+            posts = re.findall(r"PostMessageW\(hwnd, ([^)]*)\)", text)
+            assert sorted(posts) == ["WM_CLOSE, 0, 0", "WM_SYSCOMMAND, SC_MINIMIZE, 0"]
             code = re.sub(r'""".*?"""|#.*', "", text, flags=re.S)
-            assert not re.search(r"TerminateProcess|DestroyWindow|taskkill|WM_QUIT|SendMessage",
-                                 code, re.I)
+            assert not re.search(r"TerminateProcess|DestroyWindow|taskkill|WM_QUIT|SendMessage|"
+                                 r"ShowWindow|SC_CLOSE|SC_MAXIMIZE|SC_RESTORE", code, re.I)
         elif path.name == "server.py":
             # Запускает и останавливает только собственный дочерний llama-server
             # (subprocess.Popen, его terminate/kill); остальное запрещено и здесь.

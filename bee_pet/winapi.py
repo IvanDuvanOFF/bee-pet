@@ -1,13 +1,16 @@
 """Работа с чужими окнами через WinAPI (ctypes). Только Windows; на других ОС — заглушки.
 
-Действий над чужими окнами ровно два:
+Действий над чужими окнами ровно три:
 - вежливое `PostMessageW(WM_CLOSE)` в `close_window` (злая пчела кусает окно);
 - вывод окна на передний план в `focus_window` (пчела переключает окна, пока
-  пользователя нет за компьютером).
-Никаких TerminateProcess, DestroyWindow, taskkill, WM_QUIT и эмуляции нажатий
-клавиш (keybd_event, SendInput) здесь нет и быть не должно.
+  пользователя нет за компьютером);
+- вежливое сворачивание `PostMessageW(WM_SYSCOMMAND, SC_MINIMIZE)` в `minimize_window`
+  (то же, что кнопка «свернуть» в заголовке; только в шалости с ярлыками, когда окно
+  закрывает значок).
+Никаких TerminateProcess, DestroyWindow, ShowWindow для чужих окон, taskkill, WM_QUIT
+и эмуляции нажатий клавиш (keybd_event, SendInput) здесь нет и быть не должно.
 
-Третий (и последний) вид действий над чужим интерфейсом живёт отдельно, в
+Четвёртый (и последний) вид действий над чужим интерфейсом живёт отдельно, в
 `desktop_icons`: пчела от скуки меняет позиции значков на рабочем столе (только
 позиции; ничего не удаляет, не переименовывает и не открывает).
 """
@@ -22,6 +25,8 @@ log = logging.getLogger("bee_pet.winapi")
 AVAILABLE = sys.platform == "win32"
 
 WM_CLOSE = 0x0010
+WM_SYSCOMMAND = 0x0112
+SC_MINIMIZE = 0xF020
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 GWL_EXSTYLE = -20
@@ -273,6 +278,16 @@ if AVAILABLE:
         """Вежливо просит окно закрыться (WM_CLOSE). Никаких убийств процессов."""
         return bool(_api.PostMessageW(hwnd, WM_CLOSE, 0, 0))
 
+    def minimize_window(hwnd: int) -> bool:
+        """Вежливо просит окно свернуться (WM_SYSCOMMAND + SC_MINIMIZE), как кнопка в заголовке.
+
+        Приложение может обработать или проигнорировать просьбу; свернулось ли окно на
+        самом деле, проверяет вызывающий код по `list_windows`.
+        """
+        if not hwnd or not _api.IsWindow(hwnd):
+            return False
+        return bool(_api.PostMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0))
+
     def idle_seconds() -> float:
         """Сколько секунд не было ввода с клавиатуры и мыши во всей системе."""
         info = _LastInputInfo()
@@ -288,7 +303,7 @@ if AVAILABLE:
         return int(_api.GetForegroundWindow() or 0)
 
     def focus_window(hwnd: int) -> bool:
-        """Выводит окно на передний план. Второе и последнее действие над чужим окном.
+        """Выводит окно на передний план (второе из трёх действий над чужими окнами).
 
         Фоновому процессу SetForegroundWindow обычно запрещён, поэтому на время вызова
         поток пчелы подключается к очереди ввода потока текущего активного окна
@@ -319,6 +334,10 @@ else:
         return []
 
     def close_window(hwnd: int) -> bool:  # noqa: ARG001
+        """Вне Windows ничего не делает."""
+        return False
+
+    def minimize_window(hwnd: int) -> bool:  # noqa: ARG001
         """Вне Windows ничего не делает."""
         return False
 

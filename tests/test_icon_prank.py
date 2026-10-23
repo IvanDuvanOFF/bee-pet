@@ -3,6 +3,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import dataclasses
 import json
 import logging
 import math
@@ -15,15 +16,19 @@ from PySide6.QtWidgets import QApplication
 
 from bee_pet.bee_window import BeeWindow
 from bee_pet.desktop_icons import IconInfo
-from bee_pet.icon_prank import (OCCUPIED, SETTINGS_ORIGINALS, IconPrankController,
+from bee_pet.icon_prank import (MAX_MINIMIZE, OCCUPIED, SETTINGS_ORIGINALS, IconPrankController,
+                                covering_windows, icon_rect, minimize_skip_reason,
                                 pick_destination, too_close)
 from bee_pet.mood import Action
+from bee_pet.winapi import WindowInfo
 
 SCREEN = QRect(0, 0, 1920, 1080)
 AREA = QRect(0, 0, 1920, 1040)
 CELL = (100, 100)
 FAST = dict(min_s=3600, max_s=3600, hover_ms=10, follow_ms=10, carry_speed=4000.0,
-            land_retry_ms=10, autostart=False)
+            land_retry_ms=10, fly_speed=4000.0, push_ms=10, minimize_wait_ms=100,
+            minimize_poll_ms=10, autostart=False)
+OWN_PID = 4242
 
 
 def wait_for(cond, timeout_ms=5000):
@@ -92,6 +97,45 @@ class FakeIcons:
         return True
 
 
+def win(hwnd, rect, *, pid=100, proc="notepad.exe", cls="Notepad", elevated=False,
+        minimized=False, cloaked=False, tool=False):
+    return WindowInfo(hwnd=hwnd, title=f"окно {hwnd}", class_name=cls, pid=pid,
+                      process_name=proc, rect=rect, elevated=elevated, is_tool=tool,
+                      cloaked=cloaked, minimized=minimized)
+
+
+class FakeWinapi:
+    """Заглушка winapi: окна сверху вниз; свёрнутое окно видно со следующего list_windows."""
+
+    AVAILABLE = True
+
+    def __init__(self, windows=()):
+        self.windows = list(windows)
+        self.minimize_calls: list[int] = []
+        self.refuse: set[int] = set()   # эти окна просьбу свернуться игнорируют
+        self._pending: set[int] = set()
+        self.list_calls = 0
+
+    def list_windows(self):
+        self.list_calls += 1
+        self.windows = [dataclasses.replace(w, minimized=True) if w.hwnd in self._pending else w
+                        for w in self.windows]
+        self._pending.clear()
+        return list(self.windows)
+
+    def minimize_window(self, hwnd):
+        self.minimize_calls.append(hwnd)
+        if hwnd not in self.refuse:
+            self._pending.add(hwnd)
+        return True
+
+    def close_window(self, hwnd):  # шалость с ярлыками окна не закрывает
+        raise AssertionError("close_window из шалости с ярлыками")
+
+    def focus_window(self, hwnd):
+        raise AssertionError("focus_window из шалости с ярлыками")
+
+
 class FakeWander(QObject):
     landed = Signal(object)
 
@@ -128,11 +172,12 @@ def env(qapp, tmp_path):
     bee.show()
     bee.move(200, 200)
     parts = dict(bee=bee, settings=settings, icons=FakeIcons([icon(0), icon(1), icon(2)]),
-                 wander=FakeWander(), bite=FakeBite())
+                 wander=FakeWander(), bite=FakeBite(), api=FakeWinapi())
     created = []
 
     def make(**kw):
-        params = dict(FAST, icons_module=parts["icons"], rng=random.Random(5),
+        params = dict(FAST, icons_module=parts["icons"], winapi_module=parts["api"],
+                      own_pid=OWN_PID, rng=random.Random(5),
                       screens_provider=lambda: [(SCREEN, 1.0)],
                       areas_provider=lambda: [AREA])
         params.update(kw)
@@ -143,7 +188,8 @@ def env(qapp, tmp_path):
     parts["make"] = make
     yield parts
     for ctl in created:
-        for t in (ctl._timer, ctl._hover_timer, ctl._follow_timer, ctl._land_timer):
+        for t in (ctl._timer, ctl._hover_timer, ctl._follow_timer, ctl._land_timer,
+                  ctl._push_timer, ctl._poll_timer):
             t.stop()
     bee.cancel_flight()
     bee.bubble.hide()
@@ -213,6 +259,7 @@ def test_disabled_by_default_no_action(env):
     assert ctl.prank_now() is False
     ctl._on_timer()
     assert env["icons"].moves == [] and env["icons"].list_calls == 0
+    assert env["api"].list_calls == 0 and env["api"].minimize_calls == []
     assert not env["bee"].is_flying
 
 
@@ -393,3 +440,188 @@ def test_wander_and_walk_respect_occupied(env):
     assert walk._busy()
     bee.occupied_by = None
     assert walk._busy() is None
+
+
+# --- окна поверх значков: чистая проверка ---------------------------------------
+
+def test_covering_windows_ignores_system_minimized_cloaked_tool_own():
+    cell = icon_rect(20, 20, CELL)  # (20, 20, 120, 120)
+    windows = [
+        win(1, (100, 100, 500, 500)),                       # задевает угол — закрывает
+        win(2, (120, 0, 500, 500)),                         # вплотную справа — нет
+        win(3, (0, 0, 1920, 1080), cls="Progman", proc="explorer.exe"),
+        win(4, (0, 0, 1920, 1080), cls="WorkerW", proc="explorer.exe"),
+        win(5, (0, 0, 1920, 1080), cls="Shell_TrayWnd", proc="explorer.exe"),
+        win(6, (0, 0, 300, 300), minimized=True),
+        win(7, (0, 0, 300, 300), cloaked=True),
+        win(8, (0, 0, 300, 300), tool=True),
+        win(9, (0, 0, 300, 300), pid=OWN_PID),
+        win(10, (0, 0, 300, 300), elevated=True),           # закрывает (но свернуть нельзя)
+    ]
+    assert [w.hwnd for w in covering_windows(cell, windows, OWN_PID)] == [1, 10]
+
+
+def test_minimize_skip_reason():
+    rect = (0, 0, 9, 9)
+    assert minimize_skip_reason(win(1, rect), OWN_PID) is None
+    assert minimize_skip_reason(win(1, rect, elevated=True), OWN_PID)
+    assert minimize_skip_reason(win(1, rect, elevated=None), OWN_PID)
+    assert minimize_skip_reason(win(1, rect, pid=OWN_PID), OWN_PID)
+    assert minimize_skip_reason(win(1, rect, cls="Progman"), OWN_PID)
+
+
+# --- окна поверх значков: контроллер --------------------------------------------
+
+BIG = (0, 0, 700, 700)  # закрывает все значки и все места назначения рядом с ними
+
+
+def test_uncovered_icon_no_minimize(env):
+    env["api"].windows = [win(1, (1000, 500, 1600, 900)),
+                          win(2, (0, 0, 1920, 1080), cls="Progman", proc="explorer.exe")]
+    ctl = env["make"]()
+    enable(env["bee"])
+    assert ctl.prank_now() is True
+    assert ctl.state == ctl.TO_ICON
+    wait_for(lambda: ctl.state == ctl.IDLE)
+    assert env["api"].minimize_calls == []
+    assert env["icons"].moves and ctl.pranks == 1
+
+
+def test_covered_by_one_window_minimizes_then_carries(env):
+    api, icons, bee = env["api"], env["icons"], env["bee"]
+    api.windows = [win(1, BIG)]
+    ctl = env["make"](push_ms=80)
+    enable(bee)
+    assert ctl.prank_now() is True
+    assert ctl.state == ctl.TO_WINDOW and bee.occupied_by == OCCUPIED
+    assert api.minimize_calls == [] and icons.moves == []
+    wait_for(lambda: ctl.state == ctl.PUSHING)
+    assert bee.stinging and api.minimize_calls == []
+    assert bee.geometry().top() <= 1  # у заголовка окна (верхняя кромка — край экрана)
+    wait_for(lambda: ctl.state == ctl.CARRYING)
+    assert api.minimize_calls == [1] and not bee.stinging
+    assert [w.hwnd for w in ctl.minimized] == [1]
+    wait_for(lambda: ctl.state == ctl.IDLE)
+    assert icons.moves and ctl.pranks == 1
+    assert api.windows[0].minimized  # обратно не разворачивает
+    assert api.minimize_calls == [1]
+
+
+def test_two_windows_minimized_in_order(env):
+    api = env["api"]
+    api.windows = [win(1, (0, 0, 200, 400)), win(2, BIG)]
+    ctl = env["make"]()
+    enable(env["bee"])
+    assert ctl.prank_now() is True
+    wait_for(lambda: ctl.state == ctl.IDLE)
+    assert api.minimize_calls == [1, 2]
+    assert env["icons"].moves and ctl.pranks == 1
+
+
+def test_window_refuses_to_minimize_aborts(env):
+    api, icons = env["api"], env["icons"]
+    api.windows = [win(1, BIG)]
+    api.refuse = {1}
+    ctl = env["make"]()
+    enable(env["bee"])
+    assert ctl.prank_now() is True
+    wait_for(lambda: ctl.state == ctl.MINIMIZING)
+    wait_for(lambda: ctl.state == ctl.IDLE)
+    assert api.minimize_calls == [1]
+    assert icons.moves == [] and icons.movers == [] and ctl.originals() == {}
+    assert env["bee"].occupied_by is None and not env["bee"].stinging
+    assert env["wander"].nearest == 1
+
+
+def test_too_many_windows_no_minimize(env):
+    api = env["api"]
+    api.windows = [win(i, BIG) for i in range(1, MAX_MINIMIZE + 2)]
+    ctl = env["make"]()
+    enable(env["bee"])
+    assert ctl.prank_now() is False
+    assert ctl.state == ctl.IDLE and not env["bee"].is_flying
+    assert api.minimize_calls == [] and env["icons"].moves == []
+
+
+def test_elevated_window_no_minimize(env):
+    api = env["api"]
+    api.windows = [win(1, BIG, elevated=True)]
+    ctl = env["make"]()
+    enable(env["bee"])
+    assert ctl.prank_now() is False
+    api.windows = [win(1, BIG, elevated=None)]
+    assert ctl.prank_now() is False
+    assert api.minimize_calls == [] and env["icons"].moves == []
+
+
+def test_other_icon_chosen_when_covered_unminimizable(env):
+    api, icons = env["api"], env["icons"]
+    # Значки i0 и i1 под окном администратора, i2 свободен (окно до y=250).
+    api.windows = [win(1, (0, 0, 200, 250), elevated=True)]
+    ctl = env["make"]()
+    enable(env["bee"])
+    assert ctl.prank_now() is True
+    assert ctl.icon.key == icon(2).key and ctl.state == ctl.TO_ICON
+    wait_for(lambda: ctl.state == ctl.IDLE)
+    assert api.minimize_calls == []
+    assert {m[0] for m in icons.moves} == {icon(2).key}
+
+
+def test_prefers_uncovered_icon_over_minimizing(env):
+    api = env["api"]
+    api.windows = [win(1, (0, 0, 200, 250))]  # можно свернуть, но i2 свободен
+    ctl = env["make"]()
+    enable(env["bee"])
+    assert ctl.prank_now() is True
+    assert ctl.icon.key == icon(2).key and ctl.state == ctl.TO_ICON
+    wait_for(lambda: ctl.state == ctl.IDLE)
+    assert api.minimize_calls == []
+
+
+def _assert_untouched(env, ctl, calls):
+    QTest.qWait(150)
+    assert ctl.state == ctl.IDLE and env["bee"].occupied_by is None
+    assert not env["bee"].stinging
+    assert env["api"].minimize_calls == calls
+    assert env["icons"].moves == [] and env["icons"].movers == []
+
+
+def test_drag_during_push_cancels_minimize(env):
+    env["api"].windows = [win(1, BIG)]
+    ctl = env["make"](push_ms=300)
+    enable(env["bee"])
+    assert ctl.prank_now()
+    wait_for(lambda: ctl.state == ctl.PUSHING)
+    env["bee"].drag_started.emit()
+    _assert_untouched(env, ctl, [])
+
+
+def test_anger_between_windows_stops_second_minimize(env):
+    api = env["api"]
+    api.windows = [win(1, (0, 0, 200, 400)), win(2, BIG)]
+    ctl = env["make"](push_ms=300)
+    enable(env["bee"])
+    assert ctl.prank_now()
+    wait_for(lambda: api.minimize_calls == [1] and ctl.state == ctl.PUSHING)
+    env["bee"].apply_action(Action.SWAT)
+    _assert_untouched(env, ctl, [1])
+
+
+def test_toggle_off_while_waiting_for_minimize(env):
+    api = env["api"]
+    api.windows = [win(1, BIG)]
+    api.refuse = {1}
+    ctl = env["make"](minimize_wait_ms=2000)
+    enable(env["bee"])
+    assert ctl.prank_now()
+    wait_for(lambda: ctl.state == ctl.MINIMIZING)
+    env["bee"].icon_prank_action.setChecked(False)
+    _assert_untouched(env, ctl, [1])
+
+
+def test_toggle_off_never_minimizes(env):
+    env["api"].windows = [win(1, BIG)]
+    ctl = env["make"]()
+    assert ctl.prank_now() is False
+    ctl._on_timer()
+    assert env["api"].minimize_calls == [] and env["api"].list_calls == 0
