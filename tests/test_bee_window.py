@@ -422,3 +422,20 @@ def test_fly_to_and_drag_cancel_walk_and_perch(bee):
     QTest.mouseRelease(bee, Qt.LeftButton, pos=QPoint(100, 100))
     QTest.qWait(100)
     assert arrived == []
+
+
+def test_bubble_tail_flips_when_bee_moves_to_screen_top(qapp):
+    """Пчела долетела до верхнего края с открытым пузырём: пузырь под ней, хвостик вверх."""
+    from PySide6.QtGui import QGuiApplication
+    area = QGuiApplication.primaryScreen().availableGeometry()
+    b = SpeechBubble()
+    low = QRect(area.center().x(), area.center().y(), 80, 70)
+    b.show_text("бзз", low, duration_ms=5000)
+    assert not b._below
+    painted = []
+    orig = b.update
+    b.update = lambda *a: (painted.append(b._below), orig(*a))
+    b.reposition(QRect(area.center().x(), area.top() + 5, 80, 70))
+    assert b._below and b.y() > area.top() + 5  # пузырь под пчелой
+    assert painted and painted[-1] is True       # и перерисован с хвостиком вверх
+    b.hide()

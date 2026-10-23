@@ -66,12 +66,18 @@ class SpeechBubble(QWidget):
         x = self._anchor.center().x() - w // 2
         x = max(area.left(), min(x, area.right() - w + 1))
         y = self._anchor.top() - h
+        old_shape = (self._below, self._tail_x)
         self._below = y < area.top()
         if self._below:
             y = self._anchor.bottom() + 1
         y = max(area.top(), min(y, area.bottom() - h + 1))
         self._tail_x = max(PAD + TAIL_W, min(self._anchor.center().x() - x, w - PAD - TAIL_W))
         self.setGeometry(x, y, w, h)
+        # Простое перемещение окна того же размера не перерисовывает его: если пузырь
+        # перескочил под пчелу (или сдвинулся хвостик), рисуем заново, иначе хвостик
+        # остался бы смотреть вниз, когда пузырь уже под пчелой.
+        if (self._below, self._tail_x) != old_shape:
+            self.update()
 
     def _measure(self) -> tuple[int, int]:
         """Размер текста так, как его нарисует QPainter.
