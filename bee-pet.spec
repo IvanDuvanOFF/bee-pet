@@ -23,6 +23,9 @@ if not any(p.name == "llama-server.exe" for p in llama) or not models:
           "Сначала выполните: python tools\\fetch_vendor.py")
 datas += [(str(p), "vendor/llama") for p in llama]
 datas += [(str(p), "vendor/model") for p in models]
+# Тексты лицензий: код пчелы (MIT) и модель BeeLLM (Apache-2.0, в её репозитории файла нет).
+# Лицензии llama.cpp уже лежат в vendor/llama.
+datas += [(str(ROOT / "LICENSE"), "."), (str(ROOT / "licenses" / "BeeLLM-Apache-2.0.txt"), "licenses")]
 
 # Qt-модули, которые пчеле не нужны: без них exe в разы меньше.
 EXCLUDES = [

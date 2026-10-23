@@ -133,7 +133,9 @@ $env:BEE_ONEDIR="1"; .venv\Scripts\pyinstaller --noconfirm bee-pet.spec; Remove-
 
 ### Лицензии
 
-В exe входят [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT, текст лицензии
+Код пчелы распространяется по лицензии [MIT](LICENSE). Тексты лицензий вложенных
+компонентов кладутся внутрь exe: llama.cpp — из `vendor/llama/`, BeeLLM —
+[`licenses/BeeLLM-Apache-2.0.txt`](licenses/BeeLLM-Apache-2.0.txt). В exe входят [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT, текст лицензии
 кладётся в `vendor/llama/`), модель [BeeLLM](https://huggingface.co/schizophyllume/BeeLLM)
 (Apache-2.0) и PySide6/Qt (LGPL-3.0).
 
