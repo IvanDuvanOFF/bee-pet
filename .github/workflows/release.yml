@@ -1,0 +1,136 @@
+# Релиз bee-pet.exe: тесты → сборка exe с моделью → GitHub Release с тегом vX.Y.Z.
+#
+# Запускается при каждом push в master (мердж PR) и вручную (Actions → Release → Run workflow).
+# На pull request в master — только тесты и сборка, exe прикрепляется к прогону как артефакт.
+# Версия: последний тег vX.Y.Z + 1 к patch; при ручном запуске можно поднять minor/major.
+# Первый релиз — v0.1.0. Изменения только в документации релиз не запускают.
+name: Release
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "licenses/**"
+      - ".idea/**"
+      - "*.iml"
+  pull_request:
+    branches: [master]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "licenses/**"
+      - ".idea/**"
+      - "*.iml"
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Какую часть версии поднять"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write   # создать тег и релиз
+
+concurrency:
+  group: release
+  cancel-in-progress: false   # релизы строго по очереди, чтобы не схватить один номер дважды
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # нужны все теги, чтобы посчитать следующую версию
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            requirements-build.txt
+
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt -r requirements-dev.txt
+
+      - name: Тесты
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Кэш llama-server и модели
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-${{ hashFiles('tools/fetch_vendor.py') }}
+
+      - name: Скачать llama-server и модель (с проверкой SHA256)
+        run: python tools/fetch_vendor.py
+
+      - name: Следующая версия
+        id: version
+        env:
+          BUMP: ${{ github.event.inputs.bump || 'patch' }}
+        run: |
+          $tags = git tag --list 'v*' | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
+          if (-not $tags) {
+            $next = 'v0.1.0'
+          } else {
+            $last = $tags | Sort-Object { [version]($_.TrimStart('v')) } | Select-Object -Last 1
+            $v = [version]($last.TrimStart('v'))
+            switch ($env:BUMP) {
+              'major' { $next = "v$($v.Major + 1).0.0" }
+              'minor' { $next = "v$($v.Major).$($v.Minor + 1).0" }
+              default { $next = "v$($v.Major).$($v.Minor).$($v.Build + 1)" }
+            }
+          }
+          Write-Host "Следующая версия: $next"
+          "tag=$next" >> $env:GITHUB_OUTPUT
+
+      - name: Сборка exe
+        run: pyinstaller --noconfirm bee-pet.spec
+
+      - name: Файлы релиза
+        id: files
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          New-Item -ItemType Directory -Force release | Out-Null
+          $exe = "release/bee-pet-$tag-windows-x64.exe"
+          Copy-Item dist/bee-pet.exe $exe
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $exe -Leaf)" | Out-File -Encoding ascii "$exe.sha256"
+          Get-ChildItem release | Format-Table Name, Length
+          "exe=$exe" >> $env:GITHUB_OUTPUT
+
+      - name: Exe как артефакт прогона (для проверки PR)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bee-pet-pr-${{ github.event.number }}
+          path: release/
+          retention-days: 14
+
+      - name: Релиз на GitHub
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $exe = "${{ steps.files.outputs.exe }}"
+          gh release create $tag $exe "$exe.sha256" `
+            --target $env:GITHUB_SHA `
+            --title "bee-pet $tag" `
+            --generate-notes
